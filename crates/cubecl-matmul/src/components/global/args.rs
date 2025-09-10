@@ -820,10 +820,18 @@ impl<Lhs: Numeric, Rhs: Numeric, Acc: Numeric> ConcreteInputsFactory
         line_sizes: &MatmulLineSizes,
     ) -> Self::RuntimeArg<'a, R> {
         TensorInputsLaunch::new(
-            lhs.data().as_tensor_arg(line_sizes.lhs),
-            lhs.scale().map(|it| it.as_tensor_arg(1)).into(),
-            rhs.data().as_tensor_arg(line_sizes.rhs),
-            rhs.scale().map(|it| it.as_tensor_arg(1)).into(),
+            lhs.data()
+                .try_as_tensor_arg(line_sizes.lhs)
+                .expect("valid vec for lhs"),
+            lhs.scale()
+                .map(|it| it.try_as_tensor_arg(1).expect("vec=1"))
+                .into(),
+            rhs.data()
+                .try_as_tensor_arg(line_sizes.rhs)
+                .expect("valid vec for rhs"),
+            rhs.scale()
+                .map(|it| it.try_as_tensor_arg(1).expect("vec=1"))
+                .into(),
             CubeOptionArgs::None,
         )
     }
@@ -836,7 +844,8 @@ impl<EG: Numeric> ConcreteOutputFactory for Tensor<Line<EG>> {
         _problem: &MatmulProblem,
         line_sizes: &MatmulLineSizes,
     ) -> Self::RuntimeArg<'a, R> {
-        out.as_tensor_arg(line_sizes.out)
+        out.try_as_tensor_arg(line_sizes.out)
+            .expect("valid vec for out")
     }
 }
 
@@ -1249,11 +1258,15 @@ impl<Lhs: Numeric, Rhs: Numeric, EO: Numeric> ConcreteInputsFactory
         };
 
         let lhs = TensorMapArg {
-            tensor: lhs.as_tensor_arg(line_sizes.lhs),
+            tensor: lhs
+                .try_as_tensor_arg(line_sizes.lhs)
+                .expect("valid vec for lhs"),
             metadata: meta_lhs,
         };
         let rhs = TensorMapArg {
-            tensor: rhs.as_tensor_arg(line_sizes.rhs),
+            tensor: rhs
+                .try_as_tensor_arg(line_sizes.rhs)
+                .expect("valid vec for rhs"),
             metadata: meta_rhs,
         };
 
