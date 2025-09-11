@@ -22,7 +22,6 @@ use cubecl_runtime::logging::ServerLogger;
 use cubecl_runtime::memory_management::MemoryUsage;
 use cubecl_runtime::memory_management::offset_handles;
 use cubecl_runtime::storage::BindingResource;
-use cubecl_runtime::stride::contiguous_strides;
 use cubecl_runtime::timestamp_profiler::TimestampProfiler;
 use cubecl_runtime::{
     memory_management::MemoryManagement,

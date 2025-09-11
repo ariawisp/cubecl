@@ -156,20 +156,33 @@ impl ComputeServer for WgpuServer {
         &mut self,
         descriptors: Vec<CopyDescriptor<'a>>,
     ) -> DynFut<Result<Vec<Vec<u8>>, IoError>> {
-        for desc in &descriptors {
-            if contiguous_strides(desc.shape) != desc.strides {
-                return Box::pin(async { Err(IoError::UnsupportedStrides) });
-            }
-        }
         self.stream.read_buffers(descriptors)
     }
 
     fn write(&mut self, descriptors: Vec<(CopyDescriptor<'_>, &[u8])>) -> Result<(), IoError> {
         for (desc, data) in descriptors {
-            if contiguous_strides(desc.shape) != desc.strides {
-                return Err(IoError::UnsupportedStrides);
+            // Contiguous path
+            if contiguous_strides(desc.shape) == desc.strides {
+                self.stream.write(desc.binding, data);
+                continue;
             }
-            self.stream.write(desc.binding, data);
+
+            // Inner-contiguous pitched rows: rank>=2, inner-most contiguous
+            if desc.shape.len() >= 2 && desc.strides[desc.shape.len() - 1] == 1 {
+                let last = desc.shape.len() - 1;
+                let rows = desc.shape[..last].iter().product::<usize>() as u64;
+                let cols = desc.shape[last] as u64;
+                let elem = desc.elem_size as u64;
+                let row_bytes = cols * elem;
+                let row_pitch = desc.strides[last - 1] as u64 * elem;
+
+                let resource = self.stream.mem_manage.get_resource(desc.binding);
+                self.stream
+                    .write_rows_pitched(&resource, rows, row_bytes, row_pitch, data);
+                continue;
+            }
+
+            return Err(IoError::UnsupportedStrides);
         }
         Ok(())
     }
