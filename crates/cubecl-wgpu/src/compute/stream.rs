@@ -175,7 +175,6 @@ impl WgpuStream {
             let binding = descriptor.binding;
             let elem = descriptor.elem_size as u64;
             let resource = self.mem_manage.get_resource(binding);
-<<<<<<< HEAD
 
             // Contiguous path: copy entire resource range
             let is_contiguous = contiguous_strides(descriptor.shape) == descriptor.strides;
@@ -239,88 +238,6 @@ impl WgpuStream {
 
             // Unsupported complex strides
             return Box::pin(async { Err(IoError::UnsupportedStrides) });
-||||||| parent of db1bd8f6 (runtimes: strided (pitched) buffer I/O + centralized stride helpers)
-            let aligned_len = resource.size().div_ceil(align) * align;
-            let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: None,
-                size: aligned_len,
-                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            self.tasks_count += 1;
-            self.encoder.copy_buffer_to_buffer(
-                resource.buffer(),
-                resource.offset(),
-                &staging_buffer,
-                0,
-                aligned_len,
-            );
-            staging_buffers.push((staging_buffer, size));
-=======
-
-            // Contiguous path: copy entire resource range
-            let is_contiguous = contiguous_strides(descriptor.shape) == descriptor.strides;
-
-            if is_contiguous {
-                let size = descriptor.shape.iter().product::<usize>() * descriptor.elem_size;
-                let align = wgpu::COPY_BUFFER_ALIGNMENT;
-                let aligned_len = resource.size().div_ceil(align) * align;
-                let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: None,
-                    size: aligned_len,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                self.tasks_count += 1;
-                self.encoder.copy_buffer_to_buffer(
-                    resource.buffer(),
-                    resource.offset(),
-                    &staging_buffer,
-                    0,
-                    aligned_len,
-                );
-                staging.push((staging_buffer, size, None));
-                continue;
-            }
-
-            // Inner-contiguous pitched rows: rank>=2
-            if let Some(pitch_elems) = row_pitch_elems(descriptor.shape, descriptor.strides) {
-                let last = descriptor.shape.len() - 1;
-                let rows = descriptor.shape[..last].iter().product::<usize>() as u64;
-                let cols = descriptor.shape[last] as u64;
-                let row_bytes = cols * elem;
-                let row_pitch = pitch_elems as u64 * elem;
-                let total = rows * row_pitch;
-                let align = wgpu::COPY_BUFFER_ALIGNMENT;
-                let aligned_total = total.div_ceil(align) * align;
-
-                let staging_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                    label: None,
-                    size: aligned_total,
-                    usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-                    mapped_at_creation: false,
-                });
-                self.tasks_count += 1;
-                // Copy the entire pitched region once; reconstruct rows on CPU
-                self.encoder.copy_buffer_to_buffer(
-                    resource.buffer(),
-                    resource.offset(),
-                    &staging_buffer,
-                    0,
-                    aligned_total,
-                );
-                let out_size = (rows * row_bytes) as usize;
-                staging.push((
-                    staging_buffer,
-                    out_size,
-                    Some((row_bytes as usize, row_pitch as usize)),
-                ));
-                continue;
-            }
-
-            // Unsupported complex strides
-            return Box::pin(async { Err(IoError::UnsupportedStrides) });
->>>>>>> db1bd8f6 (runtimes: strided (pitched) buffer I/O + centralized stride helpers)
         }
 
         // Flush copies to queue

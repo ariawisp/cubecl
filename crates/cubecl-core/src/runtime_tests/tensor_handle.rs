@@ -114,7 +114,6 @@ pub fn test_vec_checked_noncontiguous_inner_allows_vectorized<R: Runtime>() {
     }
 }
 
-
 // Misalignment (last dim not divisible by factor) is permitted; tail handling is kernel-specific.
 // We do not error on that case in the checked API.
 

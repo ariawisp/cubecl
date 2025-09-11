@@ -558,8 +558,9 @@ impl TestCase {
             size_of::<F>(),
         )
         .expect("valid input handle");
-        let output = TensorHandleRef::<R>::try_from_parts(&output_handle, &[1], &[1], size_of::<F>())
-            .expect("valid output handle");
+        let output =
+            TensorHandleRef::<R>::try_from_parts(&output_handle, &[1], &[1], size_of::<F>())
+                .expect("valid output handle");
 
         let cube_count = 3;
         let result = shared_sum::<R, F>(&client, input, output, cube_count);

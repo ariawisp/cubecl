@@ -1,10 +1,15 @@
-use cubecl_core as cubecl;
 use cubecl::prelude::*;
+use cubecl_core as cubecl;
 
 #[derive(thiserror::Error, Debug)]
 pub enum SoftmaxSetupError {
-    #[error("input and output must be 2D tensors with identical shape (got in={in_shape:?}, out={out_shape:?})")]
-    InvalidShapes { in_shape: Vec<usize>, out_shape: Vec<usize> },
+    #[error(
+        "input and output must be 2D tensors with identical shape (got in={in_shape:?}, out={out_shape:?})"
+    )]
+    InvalidShapes {
+        in_shape: Vec<usize>,
+        out_shape: Vec<usize>,
+    },
 }
 
 #[cube(launch_unchecked)]
@@ -12,7 +17,9 @@ fn softmax_rows_kernel<E: Float>(input: &Tensor<Line<E>>, output: &mut Tensor<E>
     let rank = input.rank();
     let rows = input.shape(rank - 2);
     let row = CUBE_POS_Y;
-    if row >= rows { terminate!(); }
+    if row >= rows {
+        terminate!();
+    }
     let tid = UNIT_POS_X;
     let stride_in = input.stride(rank - 2);
     let stride_out = output.stride(rank - 2);
@@ -22,7 +29,14 @@ fn softmax_rows_kernel<E: Float>(input: &Tensor<Line<E>>, output: &mut Tensor<E>
     while j < cols {
         let idx = row * stride_in + j;
         let v = input[idx][0];
-        if has { if v > mx { mx = v; } } else { mx = v; has = true; }
+        if has {
+            if v > mx {
+                mx = v;
+            }
+        } else {
+            mx = v;
+            has = true;
+        }
         j += CUBE_DIM_X;
     }
     let mx_all = plane_max(mx);
@@ -51,7 +65,11 @@ pub fn launch_rows_ref<R: Runtime, E: Float + CubeElement>(
     output: &TensorHandleRef<'_, R>,
 ) -> Result<(), SoftmaxSetupError> {
     if input.shape != output.shape || input.shape.len() != 2 {
-        return Err(SoftmaxSetupError { in_shape: input.shape.to_vec(), out_shape: output.shape.to_vec() }.InvalidShapes);
+        return Err(SoftmaxSetupError {
+            in_shape: input.shape.to_vec(),
+            out_shape: output.shape.to_vec(),
+        }
+        .InvalidShapes);
     }
     let cols = input.shape[1] as u32;
     let count = CubeCount::Static(1, input.shape[0] as u32, 1);

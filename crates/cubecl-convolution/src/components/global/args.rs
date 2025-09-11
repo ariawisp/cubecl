@@ -50,11 +50,8 @@ impl<Lhs: Numeric, Rhs: Numeric, EO: Numeric> ConcreteInputsFactory for TensorIn
             rhs.scale()
                 .map(|it| it.try_as_tensor_arg(1).expect("vec=1"))
                 .into(),
-            bias.map(|it| {
-                it.try_as_tensor_arg(line_sizes.out)
-                    .expect("valid vec out")
-            })
-            .into(),
+            bias.map(|it| it.try_as_tensor_arg(line_sizes.out).expect("valid vec out"))
+                .into(),
         )
     }
 }
@@ -133,10 +130,7 @@ impl<Lhs: Numeric, Rhs: Numeric, EO: Numeric> ConcreteInputsFactory
         )
         .with_prefetch(prefetch_rhs);
 
-        let bias = bias.map(|it| {
-            it.try_as_tensor_arg(line_sizes.out)
-                .expect("valid vec out")
-        });
+        let bias = bias.map(|it| it.try_as_tensor_arg(line_sizes.out).expect("valid vec out"));
 
         // TODO: Think about how to handle scales with TMA
         TensorMapInputsLaunch::new(lhs, rhs, bias.into())
