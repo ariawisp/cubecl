@@ -1,8 +1,6 @@
-use crate::{
-    AutoCompiler, AutoGraphicsApi, GraphicsApi, WgpuDevice, backend, compute::WgpuServer,
-    contiguous_strides,
-};
+use crate::{AutoCompiler, AutoGraphicsApi, GraphicsApi, WgpuDevice, backend, compute::WgpuServer};
 use cubecl_common::{future, profile::TimingMethod};
+use cubecl_runtime::stride::contiguous_strides;
 
 use cubecl_core::Feature;
 use cubecl_core::{CubeCount, CubeDim, Runtime, ir::TargetProperties};

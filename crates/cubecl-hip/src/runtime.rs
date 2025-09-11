@@ -27,9 +27,10 @@ use cubecl_runtime::{
 
 use crate::{
     HipWmmaCompiler,
-    compute::{HipContext, HipServer, HipStorage, contiguous_strides},
+    compute::{HipContext, HipServer, HipStorage},
     device::AmdDevice,
 };
+use cubecl_runtime::stride::contiguous_strides;
 
 /// The values that control how a HIP Runtime will perform its calculations.
 #[derive(Default)]

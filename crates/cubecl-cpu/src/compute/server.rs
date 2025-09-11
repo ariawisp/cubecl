@@ -10,6 +10,7 @@ use cubecl_core::{
         DataTransferService, Handle, IoError, ProfileError, ProfilingToken,
     },
 };
+use cubecl_runtime::stride::contiguous_strides;
 use cubecl_runtime::{
     logging::ServerLogger,
     memory_management::{MemoryManagement, offset_handles},
@@ -226,11 +227,4 @@ impl CpuServer {
     }
 }
 
-pub(crate) fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
-    let rank = shape.len();
-    let mut strides = vec![1; rank];
-    for i in (0..rank - 1).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1];
-    }
-    strides
-}
+// Note: use cubecl_runtime::stride::contiguous_strides for canonical row-major strides.

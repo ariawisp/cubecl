@@ -6,6 +6,9 @@
 //! Strides are expressed in element units (not bytes). Element size may be used
 //! by callers to convert to/from byte pitches as needed.
 
+use alloc::vec;
+use alloc::vec::Vec;
+
 /// Canonical contiguous row-major strides for a given shape (in elements).
 ///
 /// Example: shape [R, C] -> strides [C, 1]
@@ -29,7 +32,10 @@ pub enum StridePattern {
     Contiguous,
     /// 2D with inner-most contiguous axis and a row pitch (in elements) on the outer axis.
     /// `row_pitch_elems >= cols` is required.
-    InnerContiguous2D { row_pitch_elems: usize },
+    InnerContiguous2D {
+        /// Pitch between consecutive rows in elements (not bytes).
+        row_pitch_elems: usize,
+    },
     /// Any other non-supported or irregular stride pattern.
     Other,
 }
@@ -107,9 +113,9 @@ mod tests {
 
     #[test]
     fn describe_other() {
-        // Rank 3 default to Other when not contiguous
+        // Rank 3 non-contiguous pattern should be Other
         assert!(matches!(
-            describe(&[2, 3, 4], &[12, 4, 1]),
+            describe(&[2, 3, 4], &[10, 4, 1]),
             StridePattern::Other
         ));
         // Mismatched lengths

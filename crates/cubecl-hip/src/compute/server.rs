@@ -22,6 +22,7 @@ use cubecl_runtime::logging::ServerLogger;
 use cubecl_runtime::memory_management::MemoryUsage;
 use cubecl_runtime::memory_management::offset_handles;
 use cubecl_runtime::storage::BindingResource;
+use cubecl_runtime::stride::contiguous_strides;
 use cubecl_runtime::timestamp_profiler::TimestampProfiler;
 use cubecl_runtime::{
     memory_management::MemoryManagement,
@@ -749,14 +750,7 @@ impl HipServer {
     }
 }
 
-pub(crate) fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
-    let rank = shape.len();
-    let mut strides = vec![1; rank];
-    for i in (0..rank - 1).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1];
-    }
-    strides
-}
+// Note: use cubecl_runtime::stride::contiguous_strides for canonical row-major strides.
 
 #[derive(Debug)]
 pub(crate) enum LaunchError {
