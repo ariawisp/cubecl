@@ -403,27 +403,6 @@ where
         self.data_transfer(src_descriptor, alloc_desc, dst_server)
     }
 
-    /// Write tensor data to bindings asynchronously and wait for completion.
-    pub async fn write_async(
-        &self,
-        writes: Vec<(CopyDescriptor<'_>, &[u8])>,
-    ) -> Result<(), IoError> {
-        self.profile_guard();
-        // Preflight stride compatibility.
-        for (d, _data) in &writes {
-            let shape = d.shape;
-            let strides = d.strides;
-            if !(crate::stride::is_contiguous(shape, strides)
-                || crate::stride::is_inner_contiguous_rows(shape, strides))
-            {
-                return Err(IoError::UnsupportedStrides);
-            }
-        }
-        self.channel.write(writes)?;
-        self.channel.sync().await;
-        Ok(())
-    }
-
     /// Write tensor data to bindings; panics on error.
     pub fn write(&self, writes: Vec<(CopyDescriptor<'_>, &[u8])>) {
         cubecl_common::reader::read_sync(self.write_async(writes)).unwrap()
