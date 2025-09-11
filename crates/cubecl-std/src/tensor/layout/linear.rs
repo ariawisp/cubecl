@@ -2,7 +2,7 @@ use cubecl::prelude::*;
 use cubecl_core::{self as cubecl, unexpanded};
 
 use crate::tensor::{
-    is_contiguous, is_contiguous_pitched,
+    is_contiguous_pitched,
     launch::{TypedView, TypedViewLaunch},
     layout::{
         Coords1d, Layout, VirtualLayoutOperations, VirtualLayoutOperationsExpand,
@@ -12,6 +12,7 @@ use crate::tensor::{
         virtual_layout,
     },
 };
+use cubecl_runtime::stride::is_contiguous;
 
 /// Maps a linear index based on line count to a potentially strided tensor. Only applies the
 /// necessary level of striding, either none, only the last dim (for freshly allocated strided

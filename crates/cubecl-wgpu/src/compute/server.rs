@@ -12,10 +12,11 @@ use cubecl_core::{
 };
 use cubecl_core::{
     compute::{CubeTask, DebugInformation},
-    server::{Allocation, AllocationDescriptor, IoError},
+    server::{Allocation, AllocationDescriptor, AllocationKind, IoError},
 };
 use cubecl_runtime::logging::ServerLogger;
 use cubecl_runtime::memory_management::offset_handles;
+use cubecl_runtime::stride::{contiguous_strides, pitched_rows_layout, row_pitch_elems};
 use cubecl_runtime::{
     memory_management::MemoryDeviceProperties, server::ComputeServer, storage::BindingResource,
 };
@@ -128,14 +129,23 @@ impl ComputeServer for WgpuServer {
         descriptors: Vec<AllocationDescriptor<'_>>,
     ) -> Result<Vec<Allocation>, IoError> {
         let align = self.device.limits().min_storage_buffer_offset_alignment as usize;
-        let strides = descriptors
-            .iter()
-            .map(|desc| contiguous_strides(desc.shape))
-            .collect::<Vec<_>>();
-        let sizes = descriptors
-            .iter()
-            .map(|desc| desc.shape.iter().product::<usize>() * desc.elem_size)
-            .collect::<Vec<_>>();
+
+        let mut strides_out = Vec::with_capacity(descriptors.len());
+        let mut sizes = Vec::with_capacity(descriptors.len());
+
+        for desc in &descriptors {
+            let rank = desc.shape.len();
+            if matches!(desc.kind, AllocationKind::Optimized) && rank > 1 {
+                let (strides, size) = pitched_rows_layout(desc.shape, desc.elem_size, align);
+                strides_out.push(strides);
+                sizes.push(size);
+            } else {
+                // Contiguous allocation
+                strides_out.push(contiguous_strides(desc.shape));
+                sizes.push(desc.shape.iter().product::<usize>() * desc.elem_size);
+            }
+        }
+
         let total_size = sizes
             .iter()
             .map(|it| it.next_multiple_of(align))
@@ -146,7 +156,7 @@ impl ComputeServer for WgpuServer {
 
         Ok(handles
             .into_iter()
-            .zip(strides)
+            .zip(strides_out)
             .map(|(handle, strides)| Allocation::new(handle, strides))
             .collect())
     }
@@ -166,15 +176,14 @@ impl ComputeServer for WgpuServer {
                 continue;
             }
 
-            // 2D pitched rows: support rank==2 with inner-most contiguous dimension.
-            // Note: contiguous path unchanged; pitched path uses per-row queue.write_buffer with small overhead.
-            let shape = desc.shape;
-            if shape.len() == 2 && desc.strides[1] == 1 {
-                let rows = shape[0] as u64;
-                let cols = shape[1] as u64;
+            // Inner-contiguous pitched rows: rank>=2
+            if let Some(pitch_elems) = row_pitch_elems(desc.shape, desc.strides) {
+                let last = desc.shape.len() - 1;
+                let rows = desc.shape[..last].iter().product::<usize>() as u64;
+                let cols = desc.shape[last] as u64;
                 let elem = desc.elem_size as u64;
                 let row_bytes = cols * elem;
-                let row_pitch = desc.strides[0] as u64 * elem;
+                let row_pitch = pitch_elems as u64 * elem;
 
                 let resource = self.stream.mem_manage.get_resource(desc.binding);
                 self.stream
@@ -248,13 +257,4 @@ fn compiler(backend: wgpu::Backend) -> AutoCompiler {
         wgpu::Backend::Metal => AutoCompiler::Msl(Default::default()),
         _ => AutoCompiler::Wgsl(Default::default()),
     }
-}
-
-pub(crate) fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
-    let rank = shape.len();
-    let mut strides = vec![1; rank];
-    for i in (0..rank - 1).rev() {
-        strides[i] = strides[i + 1] * shape[i + 1];
-    }
-    strides
 }
