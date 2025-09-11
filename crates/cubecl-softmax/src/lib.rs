@@ -65,11 +65,10 @@ pub fn launch_rows_ref<R: Runtime, E: Float + CubeElement>(
     output: &TensorHandleRef<'_, R>,
 ) -> Result<(), SoftmaxSetupError> {
     if input.shape != output.shape || input.shape.len() != 2 {
-        return Err(SoftmaxSetupError {
+        return Err(SoftmaxSetupError::InvalidShapes {
             in_shape: input.shape.to_vec(),
             out_shape: output.shape.to_vec(),
-        }
-        .InvalidShapes);
+        });
     }
     let cols = input.shape[1] as u32;
     let count = CubeCount::Static(1, input.shape[0] as u32, 1);
