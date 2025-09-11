@@ -1,0 +1,19 @@
+[package]
+name = "cubecl-softmax"
+version = "0.7.0"
+edition = "2024"
+description = "CubeCL row-wise softmax kernels and host helpers."
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/tracel-ai/cubecl"
+
+[features]
+default = ["std", "cubecl-core/default", "cubecl-runtime/default"]
+std = ["cubecl-core/std", "cubecl-runtime/std"]
+
+[dependencies]
+cubecl-core = { path = "../cubecl-core", version = "0.7.0", default-features = false }
+cubecl-runtime = { path = "../cubecl-runtime", version = "0.7.0", default-features = false }
+cubecl-std = { path = "../cubecl-std", version = "0.7.0", default-features = false }
+half = { version = "2" }
+num-traits = { version = "0.2" }
+thiserror = "2"
