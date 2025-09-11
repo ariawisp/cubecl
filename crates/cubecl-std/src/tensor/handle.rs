@@ -136,10 +136,6 @@ where
             elem_size: size_of::<E>(),
         }
     }
-
-    fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
-        stride_util::contiguous_strides(shape)
-    }
 }
 impl<R, E> TensorHandle<R, E>
 where
