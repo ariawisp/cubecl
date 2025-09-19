@@ -69,24 +69,24 @@ impl CpuServer {
             for desc in descriptors {
                 let binding = desc.binding;
                 let elem = desc.elem_size;
-                let resource = ctx
-                    .memory_management
-                    .get_resource(binding.memory, binding.offset_start, binding.offset_end)
-                    .ok_or(IoError::InvalidHandle)?;
-
                 let size = desc.shape.iter().product::<usize>() * elem;
 
                 // Contiguous: return zero-copy Bytes over the binding with logical len
                 if contiguous_strides(desc.shape) == desc.strides {
                     let (controller, alloc) =
                         CpuAllocController::init(binding, &mut ctx.memory_management)?;
-                    result
-                        .push(unsafe { Bytes::from_raw_parts(alloc, size, Box::new(controller)) });
+                    result.push(unsafe {
+                        Bytes::from_raw_parts(alloc, size, Box::new(controller))
+                    });
                     continue;
                 }
 
                 // Inner-contiguous rows: reconstruct rows into contiguous buffer
                 if let Some(row_pitch_elems) = row_pitch_elems(desc.shape, desc.strides) {
+                    let resource = ctx
+                        .memory_management
+                        .get_resource(binding.memory, binding.offset_start, binding.offset_end)
+                        .ok_or(IoError::InvalidHandle)?;
                     let last = desc.shape.len() - 1;
                     let rows = desc.shape[..last].iter().product::<usize>();
                     let cols = desc.shape[last];
