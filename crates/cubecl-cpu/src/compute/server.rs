@@ -75,9 +75,8 @@ impl CpuServer {
                 if contiguous_strides(desc.shape) == desc.strides {
                     let (controller, alloc) =
                         CpuAllocController::init(binding, &mut ctx.memory_management)?;
-                    result.push(unsafe {
-                        Bytes::from_raw_parts(alloc, size, Box::new(controller))
-                    });
+                    result
+                        .push(unsafe { Bytes::from_raw_parts(alloc, size, Box::new(controller)) });
                     continue;
                 }
 
