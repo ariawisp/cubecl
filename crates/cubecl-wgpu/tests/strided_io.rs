@@ -1,4 +1,4 @@
-#![cfg(all(feature = "wgpu", feature = "std"))]
+#![cfg(feature = "std")]
 
 use cubecl_common::{future::block_on, reader::read_sync};
 use cubecl_runtime::server::CopyDescriptor;
@@ -42,7 +42,6 @@ fn wgpu_strided_io_roundtrip_u8_rows_pitched() {
 
 #[test]
 fn wgpu_strided_io_roundtrip_f32_rows_pitched() {
-    #![cfg(all(feature = "wgpu", feature = "std"))]
     type R = cubecl_wgpu::WgpuRuntime;
     let client = R::client(&R::Device::default());
 
@@ -69,15 +68,12 @@ fn wgpu_strided_io_roundtrip_f32_rows_pitched() {
     let strides = [pitch_elems, 1];
 
     // Write using pitched descriptor; the runtime should place each row at row_pitch offsets.
-    let write_desc =
-        cubecl_runtime::server::CopyDescriptor::new(binding.clone(), &shape, &strides, elem_size);
-    cubecl_common::future::block_on(client.write_async(vec![(write_desc, bytes)]))
-        .expect("pitched write ok");
+    let write_desc = CopyDescriptor::new(binding.clone(), &shape, &strides, elem_size);
+    block_on(client.write_async(vec![(write_desc, bytes)])).expect("pitched write ok");
 
     // Read back using the same pitched descriptor. The runtime reconstructs contiguous rows.
-    let read_desc =
-        cubecl_runtime::server::CopyDescriptor::new(binding.clone(), &shape, &strides, elem_size);
-    let out = cubecl_common::reader::read_sync(client.read_tensor_async(vec![read_desc]));
+    let read_desc = CopyDescriptor::new(binding.clone(), &shape, &strides, elem_size);
+    let out = read_sync(client.read_tensor_async(vec![read_desc]));
     assert_eq!(out.len(), 1);
     assert_eq!(out[0], bytes);
 }
@@ -85,7 +81,6 @@ fn wgpu_strided_io_roundtrip_f32_rows_pitched() {
 #[test]
 #[should_panic]
 fn wgpu_strided_io_read_unsupported_strides_panics_rank3() {
-    #![cfg(all(feature = "wgpu", feature = "std"))]
     type R = cubecl_wgpu::WgpuRuntime;
     let client = R::client(&R::Device::default());
 
@@ -99,6 +94,6 @@ fn wgpu_strided_io_read_unsupported_strides_panics_rank3() {
     let binding = handle.binding();
 
     // Attempting to read should surface UnsupportedStrides, which panics via client read wrapper.
-    let desc = cubecl_runtime::server::CopyDescriptor::new(binding, &shape, &strides, elem_size);
+    let desc = CopyDescriptor::new(binding, &shape, &strides, elem_size);
     let _ = client.read_tensor(vec![desc]);
 }
