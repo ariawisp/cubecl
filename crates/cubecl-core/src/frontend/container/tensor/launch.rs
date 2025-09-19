@@ -274,14 +274,11 @@ impl<'a, R: Runtime> TensorHandleRef<'a, R> {
             strides.len()
         );
         debug_assert!(elem_size > 0, "element size must be > 0");
-        // Disallow zero strides when corresponding dimension extent > 1
-        for (i, (&s, &d)) in strides.iter().zip(shape.iter()).enumerate() {
-            debug_assert!(
-                !(s == 0 && d > 1),
-                "zero stride on axis {} with extent > 1",
-                i
-            );
-        }
+        // Note: zero strides are permitted here to support explicit broadcast
+        // views in advanced/internal paths. The checked constructor
+        // (`try_from_parts`) rejects them when `d > 1` to provide safety at
+        // boundaries; callers who intentionally need zero‑stride broadcasting
+        // can opt into this `unsafe` API.
         Self {
             handle,
             strides,

@@ -507,13 +507,25 @@ impl TestCase {
         output_shape[self.axis.unwrap()] = 1;
         let output_stride = self.output_stride();
 
-        let input = TensorHandleRef::<R>::try_from_parts(
+        let input = match TensorHandleRef::<R>::try_from_parts(
             &input_handle,
             &self.stride,
             &self.shape,
             size_of::<P>(),
-        )
-        .expect("valid input handle");
+        ) {
+            Ok(h) => h,
+            // Broadcasted inputs may legally use zero strides; fall back to the
+            // unsafe constructor for those specific cases to exercise kernels.
+            Err(TensorHandleError::ZeroStride { .. }) => unsafe {
+                TensorHandleRef::<R>::from_raw_parts(
+                    &input_handle,
+                    &self.stride,
+                    &self.shape,
+                    size_of::<P>(),
+                )
+            },
+            Err(e) => panic!("valid input handle: {e}"),
+        };
         let output = TensorHandleRef::<R>::try_from_parts(
             &output_handle,
             &output_stride,
