@@ -33,7 +33,10 @@ pub enum TensorHandleError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TensorArgError {
     /// Requested vectorization factor is not supported by the runtime.
-    UnsupportedVectorization { requested: u8, supported: &'static [u8] },
+    UnsupportedVectorization {
+        requested: u8,
+        supported: &'static [u8],
+    },
     /// Inner-most dimension is not contiguous (stride != 1) while vectorization > 1.
     NonContiguousInner,
     /// Inner-most dimension is not divisible by the vectorization factor.
@@ -241,11 +244,14 @@ impl<'a, R: Runtime> TensorHandleRef<'a, R> {
         vectorization: u8,
     ) -> Result<TensorArg<'a, R>, TensorArgError> {
         if !R::supported_line_sizes().contains(&vectorization) {
-            return Err(TensorArgError::UnsupportedVectorization { requested: vectorization, supported: R::supported_line_sizes() });
+            return Err(TensorArgError::UnsupportedVectorization {
+                requested: vectorization,
+                supported: R::supported_line_sizes(),
+            });
         }
         Ok(self.as_tensor_arg(vectorization))
     }
-    
+
     /// Create a handle from raw parts.
     ///
     /// # Safety
@@ -329,11 +335,20 @@ impl<'a, R: Runtime> TensorHandleRef<'a, R> {
 impl core::fmt::Display for TensorHandleError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            TensorHandleError::RankMismatch { shape_rank, stride_rank } => {
-                write!(f, "rank mismatch (shape={}, strides={})", shape_rank, stride_rank)
+            TensorHandleError::RankMismatch {
+                shape_rank,
+                stride_rank,
+            } => {
+                write!(
+                    f,
+                    "rank mismatch (shape={}, strides={})",
+                    shape_rank, stride_rank
+                )
             }
             TensorHandleError::ElemSizeZero => write!(f, "element size must be > 0"),
-            TensorHandleError::ZeroStride { axis } => write!(f, "zero stride on axis {} with extent > 1", axis),
+            TensorHandleError::ZeroStride { axis } => {
+                write!(f, "zero stride on axis {} with extent > 1", axis)
+            }
         }
     }
 }
@@ -341,10 +356,20 @@ impl core::fmt::Display for TensorHandleError {
 impl core::fmt::Display for TensorArgError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            TensorArgError::UnsupportedVectorization { requested, supported } => {
-                write!(f, "unsupported vectorization {}, supported: {:?}", requested, supported)
+            TensorArgError::UnsupportedVectorization {
+                requested,
+                supported,
+            } => {
+                write!(
+                    f,
+                    "unsupported vectorization {}, supported: {:?}",
+                    requested, supported
+                )
             }
-            TensorArgError::NonContiguousInner => write!(f, "non-contiguous innermost dimension for vectorized access"),
+            TensorArgError::NonContiguousInner => write!(
+                f,
+                "non-contiguous innermost dimension for vectorized access"
+            ),
             TensorArgError::MisalignedVectorization { last_dim, factor } => write!(
                 f,
                 "innermost dimension {} not divisible by vectorization {}",
