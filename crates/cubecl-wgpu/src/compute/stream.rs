@@ -397,6 +397,50 @@ impl WgpuStream {
         self.write_to_buffer(&resource, data);
     }
 
+    /// Coalesced write path for many bindings that target the same underlying buffer.
+    /// Groups by storage id and performs a single map/unmap (UMA) or a single queue write
+    /// per buffer range, reducing per-tensor overhead.
+    pub fn write_many(&mut self, items: Vec<(Binding, &[u8])>) {
+        if items.is_empty() {
+            return;
+        }
+        // Resolve to (storage_id, resource, data)
+        use cubecl_runtime::storage::StorageId;
+        use hashbrown::HashMap;
+
+        let mut groups: HashMap<StorageId, Vec<(WgpuResource, &[u8])>> = HashMap::new();
+        for (binding, data) in items.into_iter() {
+            let (handle, res) = self.mem_manage.get_storage_and_resource(binding);
+            groups.entry(handle.id).or_default().push((res, data));
+        }
+
+        // For each buffer, coalesce into a single write.
+        for (_id, mut entries) in groups.into_iter() {
+            entries.sort_by_key(|(r, _)| r.offset);
+            let first_buf = entries[0].0.buffer.clone();
+
+            let min_off = entries.first().unwrap().0.offset;
+            let mut max_end = min_off;
+            for (r, d) in entries.iter() {
+                let end = r.offset + d.len() as u64;
+                if end > max_end {
+                    max_end = end;
+                }
+            }
+
+            let total = (max_end - min_off) as usize;
+
+            // Coalesce into a single host buffer and write once via queue.
+            // This avoids extra map/unmap and performs very well on UMA.
+            let mut tmp = vec![0u8; total];
+            for (res, data) in entries.into_iter() {
+                let off = (res.offset - min_off) as usize;
+                tmp[off..off + data.len()].copy_from_slice(data);
+            }
+            self.queue.write_buffer(&first_buf, min_off, &tmp);
+        }
+    }
+
     pub fn start_direct_writes_if_needed(&mut self) {
         if self.prefer_direct_writes
             && (self.compute_pass.is_some() || self.tasks_count > 0)

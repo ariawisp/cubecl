@@ -9,6 +9,7 @@ use cubecl_runtime::{
     },
     storage::ComputeStorage,
 };
+use cubecl_runtime::storage::StorageHandle;
 use wgpu::BufferUsages;
 
 #[derive(Debug)]
@@ -118,6 +119,26 @@ impl WgpuMemManager {
             None => handle,
         };
         self.memory_pool.storage().get(&handle)
+    }
+
+    pub(crate) fn get_storage_and_resource(
+        &mut self,
+        binding: Binding,
+    ) -> (StorageHandle, WgpuResource) {
+        let handle = self
+            .memory_pool
+            .get(binding.memory.clone())
+            .expect("Failed to find storage!");
+        let handle = match binding.offset_start {
+            Some(offset) => handle.offset_start(offset),
+            None => handle,
+        };
+        let handle = match binding.offset_end {
+            Some(offset) => handle.offset_end(offset),
+            None => handle,
+        };
+        let res = self.memory_pool.storage().get(&handle);
+        (handle, res)
     }
 
     pub(crate) fn reserve_uniform(&mut self, size: u64) -> WgpuResource {

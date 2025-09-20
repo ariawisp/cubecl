@@ -168,14 +168,26 @@ impl ComputeServer for WgpuServer {
     }
 
     fn write(&mut self, descriptors: Vec<(CopyDescriptor<'_>, &[u8])>) -> Result<(), IoError> {
-        self.stream.start_direct_writes_if_needed();
-        for (desc, data) in descriptors {
+        // Validate strides once.
+        for (desc, _) in &descriptors {
             if contiguous_strides(desc.shape) != desc.strides {
                 return Err(IoError::UnsupportedStrides);
             }
+        }
+
+        // Coalesced path: when many writes come together (e.g., create_tensors),
+        // batch them to reduce map/unmap and queue writes.
+        // Fall back to per-item for tiny batches.
+        if descriptors.len() > 1 {
+            use cubecl_runtime::server as rt_server;
+            let items: Vec<(rt_server::Binding, &[u8])> = descriptors
+                .into_iter()
+                .map(|(d, data)| (d.binding, data))
+                .collect();
+            self.stream.write_many(items);
+        } else if let Some((desc, data)) = descriptors.into_iter().next() {
             self.stream.write(desc.binding, data);
         }
-        self.stream.finish_direct_writes();
         Ok(())
     }
 
