@@ -45,6 +45,7 @@ impl WgpuServer {
         tasks_max: usize,
         backend: wgpu::Backend,
         timing_method: TimingMethod,
+        prefer_direct_writes: bool,
     ) -> Self {
         let stream = WgpuStream::new(
             device.clone(),
@@ -53,6 +54,7 @@ impl WgpuServer {
             memory_config,
             timing_method,
             tasks_max,
+            prefer_direct_writes,
         );
 
         Self {
@@ -164,12 +166,14 @@ impl ComputeServer for WgpuServer {
     }
 
     fn write(&mut self, descriptors: Vec<(CopyDescriptor<'_>, &[u8])>) -> Result<(), IoError> {
+        self.stream.start_direct_writes_if_needed();
         for (desc, data) in descriptors {
             if contiguous_strides(desc.shape) != desc.strides {
                 return Err(IoError::UnsupportedStrides);
             }
             self.stream.write(desc.binding, data);
         }
+        self.stream.finish_direct_writes();
         Ok(())
     }
 

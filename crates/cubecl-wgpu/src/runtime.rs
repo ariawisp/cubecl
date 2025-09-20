@@ -283,6 +283,11 @@ pub(crate) fn create_client_on_setup(
 
     backend::register_features(&setup.adapter, &mut device_props, &mut compilation_options);
 
+    // Prefer direct writes on UMA-ish targets (Metal or Integrated GPUs)
+    let prefer_direct_writes =
+        setup.backend == wgpu::Backend::Metal
+            || setup.adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu;
+
     let server = WgpuServer::new(
         mem_props,
         options.memory_config,
@@ -292,6 +297,7 @@ pub(crate) fn create_client_on_setup(
         options.tasks_max,
         setup.backend,
         time_measurement,
+        prefer_direct_writes,
     );
     let channel = MutexComputeChannel::new(server);
 

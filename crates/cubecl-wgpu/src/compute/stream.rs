@@ -37,9 +37,13 @@ pub struct WgpuStream {
     submission_load: SubmissionLoad,
     staging_belt: StagingBelt,
     has_pending_uploads: bool,
+    upload_encoder: Option<wgpu::CommandEncoder>,
+    prefer_direct_writes: bool,
+    direct_phase_active: bool,
 }
 
 impl WgpuStream {
+    const STAGING_THRESHOLD: u64 = 1 << 20; // 1 MiB
     pub fn new(
         device: wgpu::Device,
         queue: wgpu::Queue,
@@ -47,6 +51,7 @@ impl WgpuStream {
         memory_config: MemoryConfiguration,
         timing_method: TimingMethod,
         tasks_max: usize,
+        prefer_direct_writes: bool,
     ) -> Self {
         let timings = if timing_method == TimingMethod::Device {
             Timings::Device(QueryProfiler::new(&queue, &device))
@@ -95,6 +100,9 @@ impl WgpuStream {
             submission_load: SubmissionLoad::default(),
             staging_belt: StagingBelt::new(1 << 20), // 1 MiB initial chunk
             has_pending_uploads: false,
+            upload_encoder: None,
+            prefer_direct_writes,
+            direct_phase_active: false,
         }
     }
 
@@ -381,11 +389,24 @@ impl WgpuStream {
     }
 
     pub fn write(&mut self, binding: Binding, data: &[u8]) {
-        // Ensure we are not recording inside an active compute pass when staging uploads.
-        // Copy commands must be recorded outside of a pass.
-        self.compute_pass = None;
         let resource = self.mem_manage.get_resource(binding);
         self.write_to_buffer(&resource, data);
+    }
+
+    pub fn start_direct_writes_if_needed(&mut self) {
+        if self.prefer_direct_writes
+            && (self.compute_pass.is_some() || self.tasks_count > 0)
+            && !self.direct_phase_active
+        {
+            // Submit recorded work once; subsequent writes can go directly to the queue
+            // while preserving ordering (FIFO across submissions).
+            self.flush();
+            self.direct_phase_active = true;
+        }
+    }
+
+    pub fn finish_direct_writes(&mut self) {
+        self.direct_phase_active = false;
     }
 
     // Nb: this function submits a command to the _queue_ not to the encoder,
@@ -393,43 +414,44 @@ impl WgpuStream {
     // Any buffer which has outstanding (not yet flushed) compute work should
     // NOT be copied to.
     fn write_to_buffer(&mut self, resource: &WgpuResource, data: &[u8]) {
-        // If a compute pass is active, preserve ordering by submitting it first and
-        // then performing a direct queue write (which is not recorded on the encoder).
-        if self.compute_pass.is_some() || self.tasks_count > 0 {
-            self.flush();
-            self.queue
-                .write_buffer(&resource.buffer, resource.offset, data);
-            return;
-        }
-        // Prefer staging uploads recorded into the current encoder to preserve ordering
-        // with pending compute work and to batch submissions. Fall back to direct queue
-        // writes only when the size is not 4-byte aligned (copy command requirement).
-
         let len = data.len() as u64;
 
         // Safety guard: never write beyond the reserved slice.
         debug_assert!(len <= resource.size);
 
-        // wgpu requires copy sizes to be multiples of 4 bytes.
-        if len % wgpu::COPY_BUFFER_ALIGNMENT as u64 == 0 {
-            // Stage the data and emit a copy into the encoder.
-            let mut slice = self.staging_belt.write_buffer(
-                &mut self.encoder,
-                &resource.buffer,
-                resource.offset,
-                NonZero::new(len).unwrap(),
-                &self.device,
-            );
-            // SAFETY: Staging belt returns a unique mapped slice of `len` bytes.
-            // We just memcpy the user data into it.
-            slice[0..data.len()].copy_from_slice(data);
+        let has_compute_pending = self.compute_pass.is_some() || self.tasks_count > 0;
 
-            // Mark that there is work to be submitted even if no compute tasks are queued.
-            self.has_pending_uploads = true;
+        // Fast path: nothing recorded yet, use direct writes (optimal on UMA, low overhead elsewhere).
+        if self.prefer_direct_writes && (!has_compute_pending || self.direct_phase_active) {
+            self.queue
+                .write_buffer(&resource.buffer, resource.offset, data);
+            return;
+        }
+
+        // Preserve ordering with already recorded work.
+        if len % wgpu::COPY_BUFFER_ALIGNMENT as u64 == 0 {
+            // On discrete GPUs, prefer staging for larger writes; for small writes, avoid
+            // the encoder overhead and flush once then direct-write.
+            if !self.prefer_direct_writes && len >= Self::STAGING_THRESHOLD {
+                self.compute_pass = None;
+                let mut slice = self.staging_belt.write_buffer(
+                    &mut self.encoder,
+                    &resource.buffer,
+                    resource.offset,
+                    NonZero::new(len).unwrap(),
+                    &self.device,
+                );
+                slice[0..data.len()].copy_from_slice(data);
+                self.has_pending_uploads = true;
+            } else {
+                // Small write: ensure order, then use direct write.
+                self.flush();
+                self.queue
+                    .write_buffer(&resource.buffer, resource.offset, data);
+            }
         } else {
-            // Rare path (sizes not 4-aligned): keep correctness by enforcing ordering.
-            // Flush pending encoder work first so this write is ordered after it,
-            // then enqueue the direct write on the queue.
+            // Can't encode a copy (needs 4B alignment): submit prior work to keep FIFO ordering,
+            // then perform a direct write which will appear after the submission.
             self.flush();
             self.queue
                 .write_buffer(&resource.buffer, resource.offset, data);
@@ -452,8 +474,8 @@ impl WgpuStream {
         // End the current compute pass.
         self.compute_pass = None;
 
-        // Submit the pending actions to the queue. This will _first_ submit the
-        // pending uniforms copy operations, then the main tasks.
+        // Submit the pending actions to the queue. This will submit the uploads first,
+        // followed by the main tasks so that data is visible before compute.
         let tasks_encoder = {
             std::mem::replace(&mut self.encoder, {
                 self.device
@@ -466,8 +488,15 @@ impl WgpuStream {
         // Finish staging uploads so all buffer copies are recorded before submission.
         self.staging_belt.finish();
 
-        // Submit all recorded work, including staged copies and compute passes.
-        let index = self.queue.submit([tasks_encoder.finish()]);
+        // Prepare command buffers in order: uploads first, then tasks.
+        let mut submits: Vec<wgpu::CommandBuffer> = Vec::with_capacity(2);
+        if let Some(upload_encoder) = self.upload_encoder.take() {
+            submits.push(upload_encoder.finish());
+        }
+        submits.push(tasks_encoder.finish());
+
+        // Submit all recorded work.
+        let index = self.queue.submit(submits);
 
         self.submission_load
             .regulate(&self.device, self.tasks_count, index);
