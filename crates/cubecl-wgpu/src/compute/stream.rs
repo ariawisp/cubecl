@@ -13,6 +13,7 @@ use cubecl_runtime::{
     memory_management::MemoryDeviceProperties, timestamp_profiler::TimestampProfiler,
 };
 use std::{future::Future, num::NonZero, pin::Pin, sync::Arc};
+use wgpu::util::StagingBelt;
 use wgpu::ComputePipeline;
 
 #[derive(Debug)]
@@ -34,6 +35,8 @@ pub struct WgpuStream {
     encoder: wgpu::CommandEncoder,
     poll: WgpuPoll,
     submission_load: SubmissionLoad,
+    staging_belt: StagingBelt,
+    has_pending_uploads: bool,
 }
 
 impl WgpuStream {
@@ -90,6 +93,8 @@ impl WgpuStream {
             poll,
             sync_buffer,
             submission_load: SubmissionLoad::default(),
+            staging_belt: StagingBelt::new(1 << 20), // 1 MiB initial chunk
+            has_pending_uploads: false,
         }
     }
 
@@ -376,10 +381,6 @@ impl WgpuStream {
     }
 
     pub fn write(&mut self, binding: Binding, data: &[u8]) {
-        // It is important to flush before writing, as the write operation is inserted
-        // into the QUEUE not the encoder. We want to make sure all outstanding work
-        // happens _before_ the write operation.
-        self.flush();
         let resource = self.mem_manage.get_resource(binding);
         self.write_to_buffer(&resource, data);
     }
@@ -389,27 +390,38 @@ impl WgpuStream {
     // Any buffer which has outstanding (not yet flushed) compute work should
     // NOT be copied to.
     fn write_to_buffer(&mut self, resource: &WgpuResource, data: &[u8]) {
-        let align = self.device.limits().min_storage_buffer_offset_alignment as usize;
-        // Copying into a buffer has to be 4 byte aligned. We can safely do so, as
-        // memory is 32 bytes aligned (see WgpuStorage).
-        let size = resource.size.next_multiple_of(align as u64);
+        // Prefer staging uploads recorded into the current encoder to preserve ordering
+        // with pending compute work and to batch submissions. Fall back to direct queue
+        // writes only when the size is not 4-byte aligned (copy command requirement).
 
-        if size == data.len() as u64 {
-            // write_buffer is the recommended way to write this data, as:
-            // - On WebGPU, from WASM, this can save a copy to the JS memory.
-            // - On devices with unified memory, this could skip the staging buffer entirely.
+        let len = data.len() as u64;
+
+        // Safety guard: never write beyond the reserved slice.
+        debug_assert!(len <= resource.size);
+
+        // wgpu requires copy sizes to be multiples of 4 bytes.
+        if len % wgpu::COPY_BUFFER_ALIGNMENT as u64 == 0 {
+            // Stage the data and emit a copy into the encoder.
+            let mut slice = self.staging_belt.write_buffer(
+                &mut self.encoder,
+                &resource.buffer,
+                resource.offset,
+                NonZero::new(len).unwrap(),
+                &self.device,
+            );
+            // SAFETY: Staging belt returns a unique mapped slice of `len` bytes.
+            // We just memcpy the user data into it.
+            slice[0..data.len()].copy_from_slice(data);
+
+            // Mark that there is work to be submitted even if no compute tasks are queued.
+            self.has_pending_uploads = true;
+        } else {
+            // Rare path (sizes not 4-aligned): keep correctness by enforcing ordering.
+            // Flush pending encoder work first so this write is ordered after it,
+            // then enqueue the direct write on the queue.
+            self.flush();
             self.queue
                 .write_buffer(&resource.buffer, resource.offset, data);
-        } else {
-            let mut buffer = self
-                .queue
-                .write_buffer_with(
-                    &resource.buffer,
-                    resource.offset,
-                    NonZero::new(size).unwrap(),
-                )
-                .unwrap();
-            buffer[0..data.len()].copy_from_slice(data);
         }
     }
 
@@ -423,7 +435,7 @@ impl WgpuStream {
     }
 
     pub fn flush(&mut self) {
-        if self.tasks_count == 0 {
+        if self.tasks_count == 0 && !self.has_pending_uploads {
             return;
         }
         // End the current compute pass.
@@ -440,17 +452,25 @@ impl WgpuStream {
             })
         };
 
-        // This will _first_ fire off all pending write_buffer work.
+        // Finish staging uploads so all buffer copies are recorded before submission.
+        self.staging_belt.finish();
+
+        // Submit all recorded work, including staged copies and compute passes.
         let index = self.queue.submit([tasks_encoder.finish()]);
 
         self.submission_load
             .regulate(&self.device, self.tasks_count, index);
+
+        // Allow the staging belt to reclaim staging buffers after GPU is done.
+        // The background poll thread will drive the mapping lifecycle.
+        self.staging_belt.recall();
 
         // Cleanup allocations and deallocations.
         self.mem_manage.memory_cleanup(false);
         self.mem_manage.release_uniforms();
 
         self.tasks_count = 0;
+        self.has_pending_uploads = false;
     }
 }
 
