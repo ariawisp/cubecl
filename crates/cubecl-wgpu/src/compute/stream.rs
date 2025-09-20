@@ -381,6 +381,9 @@ impl WgpuStream {
     }
 
     pub fn write(&mut self, binding: Binding, data: &[u8]) {
+        // Ensure we are not recording inside an active compute pass when staging uploads.
+        // Copy commands must be recorded outside of a pass.
+        self.compute_pass = None;
         let resource = self.mem_manage.get_resource(binding);
         self.write_to_buffer(&resource, data);
     }
@@ -390,6 +393,14 @@ impl WgpuStream {
     // Any buffer which has outstanding (not yet flushed) compute work should
     // NOT be copied to.
     fn write_to_buffer(&mut self, resource: &WgpuResource, data: &[u8]) {
+        // If a compute pass is active, preserve ordering by submitting it first and
+        // then performing a direct queue write (which is not recorded on the encoder).
+        if self.compute_pass.is_some() || self.tasks_count > 0 {
+            self.flush();
+            self.queue
+                .write_buffer(&resource.buffer, resource.offset, data);
+            return;
+        }
         // Prefer staging uploads recorded into the current encoder to preserve ordering
         // with pending compute work and to batch submissions. Fall back to direct queue
         // writes only when the size is not 4-byte aligned (copy command requirement).
