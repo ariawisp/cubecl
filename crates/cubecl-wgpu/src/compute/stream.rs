@@ -40,10 +40,11 @@ pub struct WgpuStream {
     upload_encoder: Option<wgpu::CommandEncoder>,
     prefer_direct_writes: bool,
     direct_phase_active: bool,
+    map_write_enabled: bool,
 }
 
 impl WgpuStream {
-    const STAGING_THRESHOLD: u64 = 1 << 20; // 1 MiB
+    // Device-driven policy; no static size threshold.
     pub fn new(
         device: wgpu::Device,
         queue: wgpu::Queue,
@@ -52,6 +53,7 @@ impl WgpuStream {
         timing_method: TimingMethod,
         tasks_max: usize,
         prefer_direct_writes: bool,
+        map_write_enabled: bool,
     ) -> Self {
         let timings = if timing_method == TimingMethod::Device {
             Timings::Device(QueryProfiler::new(&queue, &device))
@@ -69,7 +71,8 @@ impl WgpuStream {
         let poll = WgpuPoll::new(device.clone());
 
         #[allow(unused_mut)]
-        let mut mem_manage = WgpuMemManager::new(device.clone(), memory_properties, memory_config);
+        let mut mem_manage =
+            WgpuMemManager::new(device.clone(), memory_properties, memory_config, map_write_enabled);
 
         // Allocate a small buffer to use for synchronization.
         #[cfg(target_family = "wasm")]
@@ -103,6 +106,7 @@ impl WgpuStream {
             upload_encoder: None,
             prefer_direct_writes,
             direct_phase_active: false,
+            map_write_enabled,
         }
     }
 
@@ -422,17 +426,35 @@ impl WgpuStream {
         let has_compute_pending = self.compute_pass.is_some() || self.tasks_count > 0;
 
         // Fast path: nothing recorded yet, use direct writes (optimal on UMA, low overhead elsewhere).
-        if self.prefer_direct_writes && (!has_compute_pending || self.direct_phase_active) {
+        // If nothing is recorded yet, prefer a direct write regardless of device.
+        if !has_compute_pending {
             self.queue
                 .write_buffer(&resource.buffer, resource.offset, data);
+            return;
+        }
+        if self.prefer_direct_writes && self.direct_phase_active {
+            if self.map_write_enabled {
+                // Map-write path on UMA: write bytes directly into CPU-visible memory.
+                self.write_via_mapping(resource, data);
+            } else {
+                self.queue
+                    .write_buffer(&resource.buffer, resource.offset, data);
+            }
             return;
         }
 
         // Preserve ordering with already recorded work.
         if len % wgpu::COPY_BUFFER_ALIGNMENT as u64 == 0 {
-            // On discrete GPUs, prefer staging for larger writes; for small writes, avoid
-            // the encoder overhead and flush once then direct-write.
-            if !self.prefer_direct_writes && len >= Self::STAGING_THRESHOLD {
+            if self.prefer_direct_writes {
+                // UMA: ensure order once at batch start (handled outside), then direct write.
+                if self.map_write_enabled {
+                    self.write_via_mapping(resource, data);
+                } else {
+                    self.queue
+                        .write_buffer(&resource.buffer, resource.offset, data);
+                }
+            } else {
+                // Discrete: append copy to encoder to keep ordering without extra submissions.
                 self.compute_pass = None;
                 let mut slice = self.staging_belt.write_buffer(
                     &mut self.encoder,
@@ -443,19 +465,42 @@ impl WgpuStream {
                 );
                 slice[0..data.len()].copy_from_slice(data);
                 self.has_pending_uploads = true;
-            } else {
-                // Small write: ensure order, then use direct write.
-                self.flush();
-                self.queue
-                    .write_buffer(&resource.buffer, resource.offset, data);
             }
         } else {
             // Can't encode a copy (needs 4B alignment): submit prior work to keep FIFO ordering,
             // then perform a direct write which will appear after the submission.
             self.flush();
-            self.queue
-                .write_buffer(&resource.buffer, resource.offset, data);
+            if self.map_write_enabled && self.prefer_direct_writes {
+                self.write_via_mapping(resource, data);
+            } else {
+                self.queue
+                    .write_buffer(&resource.buffer, resource.offset, data);
+            }
         }
+    }
+
+    fn write_via_mapping(&mut self, resource: &WgpuResource, data: &[u8]) {
+        // Safety: buffer was created with MAP_WRITE when map_write_enabled is true.
+        // Map the target slice, copy data and unmap.
+        let start = resource.offset;
+        let end = start + data.len() as u64;
+        let buf_slice = resource.buffer.slice(start..end);
+
+        let (sender, receiver) = async_channel::bounded(1);
+        buf_slice.map_async(wgpu::MapMode::Write, move |v| {
+            let _ = sender.try_send(v);
+        });
+
+        // Poll until mapping completes.
+        let _poll = self.poll.start_polling();
+        let result = cubecl_common::reader::read_sync(async move { receiver.recv().await.unwrap() });
+        result.expect("Failed to map buffer for write");
+
+        {
+            let mut range = buf_slice.get_mapped_range_mut();
+            range.copy_from_slice(data);
+        }
+        resource.buffer.unmap();
     }
 
     fn flush_if_needed(&mut self) {

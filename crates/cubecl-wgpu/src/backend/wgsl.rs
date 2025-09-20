@@ -30,12 +30,30 @@ pub fn bindings(
 #[cfg(not(all(target_os = "macos", feature = "msl")))]
 pub async fn request_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) {
     let limits = adapter.limits();
+    // Prefer mappable primary buffers on UMA/Metal when supported to allow
+    // direct CPU writes for initial loads (e.g., safetensors apply paths).
+    let feats = adapter.features();
+    let info = adapter.get_info();
+    // Only prefer mappable primary buffers on Apple Silicon (UMA) Metal devices.
+    #[allow(unused_variables)]
+    let prefer_mappable = {
+        #[cfg(apple_silicon)]
+        {
+            (info.backend == wgpu::Backend::Metal)
+                && feats.contains(Features::MAPPABLE_PRIMARY_BUFFERS)
+        }
+        #[cfg(not(apple_silicon))]
+        {
+            false
+        }
+    };
+
+    let required_features = if prefer_mappable { feats } else { feats.difference(Features::MAPPABLE_PRIMARY_BUFFERS) };
+
     adapter
         .request_device(&wgpu::DeviceDescriptor {
             label: None,
-            required_features: adapter
-                .features()
-                .difference(Features::MAPPABLE_PRIMARY_BUFFERS),
+            required_features,
             required_limits: limits,
             // The default is MemoryHints::Performance, which tries to do some bigger
             // block allocations. However, we already batch allocations, so we

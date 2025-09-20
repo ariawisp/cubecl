@@ -24,18 +24,26 @@ impl WgpuMemManager {
         device: wgpu::Device,
         memory_properties: MemoryDeviceProperties,
         memory_config: MemoryConfiguration,
+        allow_map_write: bool,
     ) -> Self {
         // Allocate storage & memory management for the main memory buffers. Any calls
         // to empty() or create() with a small enough size will be allocated from this
         // main memory pool.
+        let main_usages = {
+            let mut u = BufferUsages::STORAGE
+                | BufferUsages::COPY_SRC
+                | BufferUsages::COPY_DST
+                | BufferUsages::INDIRECT;
+            if allow_map_write {
+                u |= BufferUsages::MAP_WRITE;
+            }
+            u
+        };
         let memory_main = MemoryManagement::from_configuration(
             WgpuStorage::new(
                 memory_properties.alignment as usize,
                 device.clone(),
-                BufferUsages::STORAGE
-                    | BufferUsages::COPY_SRC
-                    | BufferUsages::COPY_DST
-                    | BufferUsages::INDIRECT,
+                main_usages,
             ),
             &memory_properties,
             memory_config,

@@ -46,6 +46,7 @@ impl WgpuServer {
         backend: wgpu::Backend,
         timing_method: TimingMethod,
         prefer_direct_writes: bool,
+        map_write_enabled: bool,
     ) -> Self {
         let stream = WgpuStream::new(
             device.clone(),
@@ -55,6 +56,7 @@ impl WgpuServer {
             timing_method,
             tasks_max,
             prefer_direct_writes,
+            map_write_enabled,
         );
 
         Self {

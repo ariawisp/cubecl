@@ -283,10 +283,13 @@ pub(crate) fn create_client_on_setup(
 
     backend::register_features(&setup.adapter, &mut device_props, &mut compilation_options);
 
-    // Prefer direct writes on UMA-ish targets (Metal or Integrated GPUs)
+    // Prefer direct writes broadly on UMA/integrated targets
     let prefer_direct_writes =
-        setup.backend == wgpu::Backend::Metal
-            || setup.adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu;
+        setup.adapter.get_info().device_type == wgpu::DeviceType::IntegratedGpu
+            || setup.backend == wgpu::Backend::Metal;
+    // Enable MAP_WRITE only on Apple Silicon (UMA) when feature is supported
+    let map_write_enabled = cfg!(apple_silicon)
+        && features.contains(wgpu::Features::MAPPABLE_PRIMARY_BUFFERS);
 
     let server = WgpuServer::new(
         mem_props,
@@ -298,6 +301,7 @@ pub(crate) fn create_client_on_setup(
         setup.backend,
         time_measurement,
         prefer_direct_writes,
+        map_write_enabled,
     );
     let channel = MutexComputeChannel::new(server);
 
