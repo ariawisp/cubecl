@@ -7,6 +7,9 @@ pub use cubecl_runtime::memory_management::MemoryAllocationMode;
 #[cfg(feature = "wgpu")]
 pub use cubecl_wgpu as wgpu;
 
+#[cfg(feature = "metal4")]
+pub use cubecl_metal4 as metal4;
+
 #[cfg(feature = "cuda")]
 pub use cubecl_cuda as cuda;
 

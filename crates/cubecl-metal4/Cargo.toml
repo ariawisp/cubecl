@@ -1,0 +1,55 @@
+[package]
+name = "cubecl-metal4"
+version = "0.7.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "CubeCL Metal 4 runtime (MSL 4.0, MTLTensor, MPP)"
+repository = "https://github.com/tracel-ai/cubecl"
+
+[lib]
+name = "cubecl_metal4"
+path = "src/lib.rs"
+
+[features]
+default = ["std"]
+std = []
+
+[dependencies]
+cubecl-core = { path = "../cubecl-core", version = "0.7.0" }
+cubecl-common = { path = "../cubecl-common", version = "0.7.0" }
+cubecl-runtime = { path = "../cubecl-runtime", version = "0.7.0" }
+cubecl-msl4 = { path = "../cubecl-msl4", version = "0.7.0" }
+
+# objc2 Metal 4 stack (metal-safe branch)
+objc2 = { git = "https://github.com/madsmtm/objc2", rev = "325ff167465d74f0d5187b4b1b8b231d2be21efe", default-features = false, features = ["std"] }
+objc2-foundation = { git = "https://github.com/madsmtm/objc2", rev = "325ff167465d74f0d5187b4b1b8b231d2be21efe", package = "objc2-foundation", default-features = false, features = ["std","NSArray","NSString","NSError"] }
+objc2-metal = { git = "https://github.com/madsmtm/objc2", rev = "325ff167465d74f0d5187b4b1b8b231d2be21efe", package = "objc2-metal", default-features = false, features = [
+    "std",
+    "MTLTypes",
+    "MTLResource",
+    "MTLBuffer",
+    "MTLGPUAddress",
+    "MTLCommandEncoder",
+    "MTLCommandQueue",
+    "MTLCommandBuffer",
+    "MTLComputeCommandEncoder",
+    "MTLComputePipeline",
+    "MTLComputePass",
+    "MTLDevice",
+    "MTL4Compiler",
+    "MTL4CompilerTask",
+    "MTL4CommandQueue",
+    "MTL4CommandBuffer",
+    "MTL4ComputeCommandEncoder",
+    "MTL4ArgumentTable",
+    "MTL4CommandEncoder",
+    "MTL4ComputePipeline",
+    "MTL4PipelineState",
+    "MTL4FunctionDescriptor",
+    "MTLLibrary",
+    "MTLFunctionDescriptor",
+    "MTL4LibraryFunctionDescriptor",
+    "MTLTensor",
+] }
+objc2-metal-performance-shaders = { git = "https://github.com/madsmtm/objc2", rev = "325ff167465d74f0d5187b4b1b8b231d2be21efe", package = "objc2-metal-performance-shaders", default-features = false, features = ["std","MPSMatrix","MPSNDArray","MPSMatrixMultiplication","MPSNDArrayMatrixMultiplication"] }
+hashbrown = "0.15"
