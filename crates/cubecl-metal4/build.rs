@@ -17,16 +17,15 @@ fn main() {
         );
     }
 
-    // Enforce a minimum deployment target when available. Metal 4 APIs are available on macOS 15+.
+    // Enforce a minimum deployment target when available. Project requirement: macOS 26+.
     if let Ok(dep) = env::var("MACOSX_DEPLOYMENT_TARGET") {
         if let Some((maj, _min)) = parse_version(&dep) {
-            if maj < 15 {
+            if maj < 26 {
                 panic!(
-                    "MACOSX_DEPLOYMENT_TARGET={} is too low for Metal 4. Set MACOSX_DEPLOYMENT_TARGET=15.0 or newer.",
+                    "MACOSX_DEPLOYMENT_TARGET={} is too low for this Metal 4 build. Set MACOSX_DEPLOYMENT_TARGET=26.0 or newer.",
                     dep
                 );
             }
         }
     }
 }
-
