@@ -69,8 +69,7 @@ pub struct Metal4Server {
     inflight_tensors: Vec<Vec<Retained<ProtocolObject<dyn MTLTensor>>>>,
     // Pipeline cache
     pipelines: HashMap<KernelId, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
-    /// Whether to allow pointer fallback if tensor creation fails (env-gated).
-    allow_pointer_fallback: bool,
+    // Pointer fallback removed: typed tensors are required for MTL4 path.
 }
 
 // Mark server Send/Sync: Metal device/queue are safe to share across threads for command creation.
@@ -108,7 +107,6 @@ impl Metal4Server {
         let mm_props = MMProps { max_page_size: memory_properties.max_page_size, alignment: memory_properties.alignment };
         let storage = Metal4Storage::new(device.clone(), alignment);
         let mem_manage = MemoryManagement::from_configuration(storage, &mm_props, memory_config.clone());
-        let allow_pointer_fallback = std::env::var("CUBECL_MTL4_POINTER_FALLBACK").ok().map(|v| v == "1" || v.to_lowercase()=="true").unwrap_or(false);
         // Create a reusable command buffer and allocator ring
         let cb = device.newCommandBuffer();
         let mut allocators: Vec<Retained<ProtocolObject<dyn MTL4CommandAllocator>>> = Vec::new();
@@ -141,7 +139,6 @@ impl Metal4Server {
             inflight_tables,
             inflight_tensors,
             pipelines: HashMap::new(),
-            allow_pointer_fallback,
         }
     }
 }
@@ -573,15 +570,8 @@ impl ComputeServer for Metal4Server {
                 let tensor = match unsafe { buf.newTensorWithDescriptor_offset_error(&td, offset) } {
                     Ok(t) => t,
                     Err(_) => {
-                        if self.allow_pointer_fallback {
-                            let addr = (res.gpu_address as usize + res.offset) as MTLGPUAddress;
-                            unsafe { arg_table.setAddress_atIndex(addr, next_index as NSUInteger) };
-                            next_index += 1;
-                            continue;
-                        } else {
-                            eprintln!("[cubecl-metal4] ERROR: Failed to create MTLTensor for slot {}.", next_index);
-                            return;
-                        }
+                        eprintln!("[cubecl-metal4] ERROR: Failed to create MTLTensor for slot {}.", next_index);
+                        return;
                     }
                 };
                 let rid = tensor.gpuResourceID();
