@@ -158,6 +158,36 @@ impl Compiler for Msl4Compiler {
 
         // Emit basic elementwise on buffers (use operator[] for tensors)
         // Vectorized per-lane loop guarded by logical length from metadata
+        // Prepare extended metadata helpers (top-level) and per-buffer ext indices
+        let mut top_helpers = String::new();
+        let mut ext_indices_consts = String::new();
+        if has_metadata {
+            let mut num_ext = 0u32;
+            for b in &kernel.buffers { if b.has_extended_meta { num_ext += 1; } }
+            top_helpers.push_str(
+                "inline uint2 __cube_get_dims(constant uint* meta, uint META_N, uint EXT_N, uint ext_idx) {\n"
+            );
+            top_helpers.push_str(
+                "    const uint RANKS_BASE = META_N * 2u;\n    const uint SHAPE_OFFS_BASE = RANKS_BASE + EXT_N;\n    if (ext_idx >= EXT_N) return uint2(0u,0u);\n    const uint rank = meta[RANKS_BASE + ext_idx];\n    const uint shape_off = meta[SHAPE_OFFS_BASE + ext_idx];\n    if (shape_off == 0u) return uint2(0u,0u);\n    if (rank >= 2u) { const uint m = meta[shape_off + 0u]; const uint n = meta[shape_off + 1u]; return uint2(m,n); }\n    else if (rank == 1u) { const uint m = meta[shape_off + 0u]; return uint2(m,1u); }\n    else { return uint2(0u,0u); }\n}\n\n"
+            );
+            top_helpers.push_str(
+                "inline uint2 __cube_get_strides(constant uint* meta, uint META_N, uint EXT_N, uint ext_idx) {\n"
+            );
+            top_helpers.push_str(
+                "    const uint RANKS_BASE = META_N * 2u;\n    const uint SHAPE_OFFS_BASE = RANKS_BASE + EXT_N;\n    const uint STRIDE_OFFS_BASE = SHAPE_OFFS_BASE + EXT_N;\n    if (ext_idx >= EXT_N) return uint2(0u,0u);\n    const uint stride_off = meta[STRIDE_OFFS_BASE + ext_idx];\n    if (stride_off == 0u) return uint2(0u,0u);\n    const uint s0 = meta[stride_off + 0u]; const uint s1 = meta[stride_off + 1u]; return uint2(s0,s1);\n}\n\n"
+            );
+            // Per-buffer ext index constants (emitted inside kernel body)
+            let mut seen: i32 = 0;
+            for b in &kernel.buffers {
+                if b.has_extended_meta {
+                    ext_indices_consts.push_str(&format!("    const int EXT_IDX_{} = {} ;\n", ext_indices_consts.lines().count(), seen));
+                    seen += 1;
+                } else {
+                    ext_indices_consts.push_str(&format!("    const int EXT_IDX_{} = -1;\n", ext_indices_consts.lines().count()));
+                }
+            }
+        }
+
         let body = if let Some(dst) = output_index {
             let header = if has_metadata {
                 format!(
@@ -173,25 +203,36 @@ impl Compiler for Msl4Compiler {
 
             let guard_if = if has_metadata { Some("if (idx < __len) ") } else { None };
             let gen_bin = |op: &str, a: usize, b: usize| -> String {
-                // Broadcasting: if an input logical length is 1, use index 0 for that input
-                let preface = if has_metadata {
-                    format!(
+                let mut code = String::new();
+                code.push_str(&header);
+                if has_metadata {
+                    code.push_str(&format!("    const uint META_N = {}u;\n    const uint EXT_N = {}u;\n", num_meta, {
+                        let mut c=0u32; for b in &kernel.buffers { if b.has_extended_meta { c+=1; } } c
+                    }));
+                    code.push_str(&ext_indices_consts);
+                    code.push_str(&format!(
                         "    const uint __lenA = __meta[{}u + {}u];\n    const uint __lenB = __meta[{}u + {}u];\n",
                         num_meta, a as u32, num_meta, b as u32
-                    )
-                } else {
-                    String::new()
-                };
-                match guard_if {
-                    Some(pre) => format!(
-                        "{header}{preface}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const uint idx = (uint)(base + lane);\n        const uint ia = (__lenA == 1u) ? 0u : idx;\n        const uint ib = (__lenB == 1u) ? 0u : idx;\n        {pre}{{ b{dst}[idx] = b{a}[ia] {op} b{b}[ib]; }}\n    }}\n",
-                        header = header, preface = preface, pre = pre, dst = dst, a = a, b = b, op = op
-                    ),
-                    None => format!(
-                        "{header}{preface}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const uint idx = (uint)(base + lane);\n        const uint ia = (__lenA == 1u) ? 0u : idx;\n        const uint ib = (__lenB == 1u) ? 0u : idx;\n        b{dst}[idx] = b{a}[ia] {op} b{b}[ib];\n    }}\n",
-                        header = header, preface = preface, dst = dst, a = a, b = b, op = op
-                    ),
+                    ));
                 }
+                code.push_str("    for (uint lane = 0; lane < LINE; ++lane) {\n        const uint idx = (uint)(base + lane);\n");
+                if has_metadata {
+                    code.push_str(&format!("        const int EXT_OUT = EXT_IDX_{};\n", dst));
+                    code.push_str("        uint2 out_dims = (EXT_OUT >= 0) ? __cube_get_dims(__meta, META_N, EXT_N, (uint)EXT_OUT) : uint2(0u,0u);\n");
+                    code.push_str("        bool use_rank2 = (out_dims.x > 0u) && (out_dims.y > 0u) && (out_dims.x * out_dims.y == __len);\n");
+                    code.push_str(&format!("        const int EXT_A = EXT_IDX_{};\n", a));
+                    code.push_str("        uint ia = idx;\n        if (use_rank2 && EXT_A >= 0) { uint row = idx / out_dims.y; uint col = idx % out_dims.y; uint2 a_dims = __cube_get_dims(__meta, META_N, EXT_N, (uint)EXT_A); uint2 a_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_A); uint rA = (a_dims.x == 1u) ? 0u : row; uint cA = (a_dims.y == 1u) ? 0u : col; ia = rA * a_str.x + cA * a_str.y; } else { ia = (__lenA == 1u) ? 0u : idx; }\n");
+                    code.push_str(&format!("        const int EXT_B = EXT_IDX_{};\n", b));
+                    code.push_str("        uint ib = idx;\n        if (use_rank2 && EXT_B >= 0) { uint row = idx / out_dims.y; uint col = idx % out_dims.y; uint2 b_dims = __cube_get_dims(__meta, META_N, EXT_N, (uint)EXT_B); uint2 b_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_B); uint rB = (b_dims.x == 1u) ? 0u : row; uint cB = (b_dims.y == 1u) ? 0u : col; ib = rB * b_str.x + cB * b_str.y; } else { ib = (__lenB == 1u) ? 0u : idx; }\n");
+                } else {
+                    code.push_str("        const uint ia = idx; const uint ib = idx;\n");
+                }
+                match guard_if {
+                    Some(pre) => code.push_str(&format!("        {}{{ b{}[idx] = b{}[ia] {} b{}[ib]; }}\n", pre, dst, a, op, b)),
+                    None => code.push_str(&format!("        b{}[idx] = b{}[ia] {} b{}[ib];\n", dst, a, op, b)),
+                }
+                code.push_str("    }\n");
+                code
             };
             let gen_un = |func: &str, a: usize| -> String {
                 if func.is_empty() {
@@ -281,7 +322,8 @@ impl Compiler for Msl4Compiler {
         };
 
         let src = format!(
-            "#include <metal_stdlib>\n#include <metal_tensor>\nusing namespace metal;\n\n[[ kernel ]] void {name}({params}) {{\n{body}}}\n",
+            "#include <metal_stdlib>\n#include <metal_tensor>\nusing namespace metal;\n\n{helpers}[[ kernel ]] void {name}({params}) {{\n{body}}}\n",
+            helpers = top_helpers,
             name = name,
             params = param_list,
             body = body

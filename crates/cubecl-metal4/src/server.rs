@@ -491,76 +491,28 @@ impl ComputeServer for Metal4Server {
                 let info = buf_info.and_then(|bi| bi.get(i));
                 let dtype = info.and_then(|p| map_elem_type_to_tensor_dtype(p.elem)).unwrap_or(MTLTensorDataType::UInt8);
                 let elem_size = info.map(|p| elem_size_bytes(p.elem)).unwrap_or(1) as u64;
-                // Prefer extended metadata rank/shape/strides when available
-                let (dims, strides) = if info.map(|p| p.has_extended_meta).unwrap_or(false)
-                    && data.len() >= stride_offs_start
-                {
-                    // ext_idx = number of previous buffers with extended meta
-                    let mut ext_idx = 0usize;
-                    if let Some(bi) = buf_info {
-                        for k in 0..i {
-                            if bi.get(k).map(|p| p.has_extended_meta).unwrap_or(false) {
-                                ext_idx += 1;
-                            }
-                        }
-                    }
-                    if ext_idx < num_ext {
-                        let rank = data.get(ranks_start + ext_idx).copied().unwrap_or(1) as usize;
-                        let shape_base = data.get(shape_offs_start + ext_idx).copied().unwrap_or(0) as usize;
-                        let stride_base = data.get(stride_offs_start + ext_idx).copied().unwrap_or(0) as usize;
-                        if shape_base + rank <= data.len() && stride_base + rank <= data.len() && rank > 0 {
-                            let mut shape_vals: Vec<NSInteger> = (0..rank)
-                                .map(|d| data[shape_base + d] as NSInteger)
-                                .collect();
-                            let mut stride_vals: Vec<NSInteger> = (0..rank)
-                                .map(|d| data[stride_base + d] as NSInteger)
-                                .collect();
-                            if shape_vals.is_empty() {
-                                shape_vals.push(((res.size - res.offset as u64) / elem_size) as NSInteger);
-                            }
-                            if stride_vals.is_empty() { stride_vals.push(1 as NSInteger); }
-                            let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), rank as NSUInteger, shape_vals.as_ptr()) }
-                                .expect("extents");
-                            let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), rank as NSUInteger, stride_vals.as_ptr()) }
-                                .expect("strides");
-                            (dims, strides)
-                        } else {
-                            // Fallback to rank-1
-                            let len: NSInteger = if data.len() >= total_bufs * 2 {
-                                data[total_bufs + i] as NSInteger
-                            } else {
-                                ((res.size - res.offset as u64) / elem_size) as NSInteger
-                            };
-                            let shape_vals = [len];
-                            let stride_vals = [1 as NSInteger];
-                            let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
-                                .expect("extents");
-                            let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }
-                                .expect("strides");
-                            (dims, strides)
-                        }
-                    } else {
-                        // Fallback to rank-1 using scalar length
-                        let len: NSInteger = (res.size / elem_size as u64) as NSInteger;
-                        let shape_vals = [len];
-                        let stride_vals = [1 as NSInteger];
-                        let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
-                            .expect("extents");
-                        let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }
-                            .expect("strides");
-                        (dims, strides)
-                    }
-                } else {
-                    // Rank-1 default using scalar length
-                    let len: NSInteger = (res.size / elem_size as u64) as NSInteger;
-                    let shape_vals = [len];
-                    let stride_vals = [1 as NSInteger];
-                    let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
-                        .expect("extents");
-                    let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }
-                        .expect("strides");
-                    (dims, strides)
-                };
+                // For stability, bind as rank-1 tensor view using scalar length even when extended metadata exists.
+                // Extended metadata is still passed separately for broadcast/indexing in MSL.
+                let len: NSInteger = (res.size / elem_size as u64) as NSInteger;
+                let shape_vals = [len];
+                let stride_vals = [1 as NSInteger];
+                let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
+                    .expect("extents");
+                let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }
+                    .expect("strides");
+                if std::env::var("CUBECL_MTL4_DEBUG").ok().as_deref() == Some("1") {
+                    let mut dbg_dims: Vec<isize> = Vec::new();
+                    let mut dbg_strides: Vec<isize> = Vec::new();
+                    // Read back dims/strides from our temporary extents to log (unsafe APIs don't expose readback; log computed arrays instead)
+                    // We already have 'shape_vals' and 'stride_vals' in scope above when extended meta is present. For fallback rank-1 we reconstructed arrays.
+                    // Here, rebuild basic debug from allocations we computed.
+                    // Note: We cannot deref MTLTensorExtents here; just log our computed parameters below instead.
+                    let _ = (dbg_dims, dbg_strides); // avoid unused warning
+                    println!(
+                        "[cubecl-metal4] tensor bind i={} dtype={:?} elem_size={} buffer_size={} offset={} (extended_meta={})",
+                        i, dtype, elem_size, res.size, res.offset, info.map(|p| p.has_extended_meta).unwrap_or(false)
+                    );
+                }
                 let td = MTLTensorDescriptor::new();
                 td.setDimensions(&dims);
                 td.setStrides(Some(&strides));
@@ -728,6 +680,23 @@ impl ComputeServer for Metal4Server {
             // Ensure resources are made resident for this dispatch now that all bindings are in the table
             self.residency.requestResidency();
             self.residency.commit();
+            // Optional binding summary (debug)
+            if std::env::var("CUBECL_MTL4_DEBUG").ok().as_deref() == Some("1") {
+                let scalars = scalar_bind_count;
+                let meta = meta_bind_count;
+                let aux = aux_bind_count;
+                let bufs = bindings.buffers.len();
+                println!(
+                    "[cubecl-metal4] bind summary: entry={} buffers={} meta={} aux={} scalars={} table_cap={} final_index={}",
+                    compile.entrypoint_name,
+                    bufs,
+                    meta,
+                    aux,
+                    scalars,
+                    buf_bind_count,
+                    next_index
+                );
+            }
             // Attach table after binding is complete (snapshot on dispatch)
             encoder.setArgumentTable(Some(&arg_table));
             // Attach owned buffers to this frame slot to keep them alive until fence signals

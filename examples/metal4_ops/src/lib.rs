@@ -218,4 +218,118 @@ pub fn run<R: Runtime>(device: &R::Device) {
         #[cfg(feature = "metal4")]
         run_float_one::<R, f16>(&client, vec);
     }
+
+    // Rank-2 broadcast demo: A shape (M,N), B shape (M,1)
+    run_rank2_broadcast::<R, f32>(&client, 3, 4, 4);
+    // Rank-2 broadcast demo: A shape (1,N), B shape (M,N)
+    run_rank2_broadcast_row::<R, f32>(&client, 3, 5, 4);
+}
+
+#[cube(launch_unchecked)]
+fn add_tensor_2d<F: Float>(a: &Tensor<Line<F>>, b: &Tensor<Line<F>>, out: &mut Tensor<Line<F>>) {
+    if ABSOLUTE_POS < out.len() {
+        out[ABSOLUTE_POS] = a[ABSOLUTE_POS] + b[ABSOLUTE_POS];
+    }
+}
+
+fn compact_strides(shape: &[usize]) -> Vec<usize> {
+    if shape.is_empty() { return vec![]; }
+    let mut s = vec![1usize; shape.len()];
+    for i in (0..shape.len()-1).rev() { s[i] = s[i+1]*shape[i+1]; }
+    s
+}
+
+fn run_rank2_broadcast<R: Runtime, F: Float + CubeElement + ToF32>(client: &ComputeClient<R::Server, R::Channel>, m: usize, n: usize, vec: u8) {
+    let shape_out = vec![m, n];
+    let shape_b = vec![m, 1];
+    let strides_out = compact_strides(&shape_out);
+    let strides_b = compact_strides(&shape_b);
+    let elems = m * n;
+
+    // Create input data
+    let mut a: Vec<F> = Vec::with_capacity(elems);
+    let mut b: Vec<F> = Vec::with_capacity(m);
+    for i in 0..m { for j in 0..n { a.push(F::new((i as f32) * 10.0 + j as f32)); } }
+    for i in 0..m { b.push(F::new((i as f32) * 1.0)); }
+    // Expand b to shape (m,1)
+    let mut b_full: Vec<F> = Vec::with_capacity(m);
+    for i in 0..m { b_full.push(b[i]); }
+
+    let a_h = client.create(F::as_bytes(&a));
+    let b_h = client.create(F::as_bytes(&b_full));
+    let out_h = client.empty(elems * core::mem::size_of::<F>());
+
+    unsafe {
+        let dim = CubeDim::new(std::cmp::max(((elems as u32) + vec as u32 - 1) / vec as u32, 1), 1, 1);
+        add_tensor_2d::launch_unchecked::<F, R>(
+            client,
+            CubeCount::Static(1,1,1),
+            dim,
+            TensorArg::from_raw_parts::<F>(&a_h, &strides_out, &shape_out, vec),
+            TensorArg::from_raw_parts::<F>(&b_h, &strides_b, &shape_b, vec),
+            TensorArg::from_raw_parts::<F>(&out_h, &strides_out, &shape_out, vec),
+        );
+    }
+    future::block_on(client.sync());
+
+    let out_b = client.read_one(out_h);
+    let out = F::from_bytes(&out_b);
+    // Expected CPU result with broadcast along N
+    let mut expect: Vec<F> = Vec::with_capacity(elems);
+    for i in 0..m { for j in 0..n { expect.push(F::new(((i as f32) * 10.0 + j as f32) + (i as f32))); } }
+    let approx = |u:&[F], v:&[F]| -> bool {
+        if u.len()!=v.len() { return false; }
+        u.iter().zip(v.iter()).all(|(x,y)| {
+            let ux: f32 = (*x).to_f32();
+            let vy: f32 = (*y).to_f32();
+            (ux - vy).abs() < 1e-3 * f32::max(1.0, vy.abs())
+        })
+    };
+    println!("[rank2 f32 vec={}] add(MxN + Mx1) ok? {}", vec, approx(out, &expect));
+}
+
+fn run_rank2_broadcast_row<R: Runtime, F: Float + CubeElement + ToF32>(client: &ComputeClient<R::Server, R::Channel>, m: usize, n: usize, vec: u8) {
+    let shape_out = vec![m, n];
+    let shape_a = vec![1, n];
+    let strides_out = compact_strides(&shape_out);
+    let strides_a = compact_strides(&shape_a);
+    let elems = m * n;
+
+    // Create input data
+    let mut a_row: Vec<F> = Vec::with_capacity(n);
+    let mut b: Vec<F> = Vec::with_capacity(elems);
+    for j in 0..n { a_row.push(F::new(j as f32)); }
+    for i in 0..m { for j in 0..n { b.push(F::new((i as f32) * 2.0 + j as f32)); } }
+
+    let a_h = client.create(F::as_bytes(&a_row));
+    let b_h = client.create(F::as_bytes(&b));
+    let out_h = client.empty(elems * core::mem::size_of::<F>());
+
+    unsafe {
+        let dim = CubeDim::new(std::cmp::max(((elems as u32) + vec as u32 - 1) / vec as u32, 1), 1, 1);
+        add_tensor_2d::launch_unchecked::<F, R>(
+            client,
+            CubeCount::Static(1,1,1),
+            dim,
+            TensorArg::from_raw_parts::<F>(&a_h, &strides_a, &shape_a, vec),
+            TensorArg::from_raw_parts::<F>(&b_h, &strides_out, &shape_out, vec),
+            TensorArg::from_raw_parts::<F>(&out_h, &strides_out, &shape_out, vec),
+        );
+    }
+    future::block_on(client.sync());
+
+    let out_b = client.read_one(out_h);
+    let out = F::from_bytes(&out_b);
+    // Expected CPU result with broadcast along M (rows)
+    let mut expect: Vec<F> = Vec::with_capacity(elems);
+    for i in 0..m { for j in 0..n { expect.push(F::new((j as f32) + ((i as f32) * 2.0 + j as f32))); } }
+    let approx = |u:&[F], v:&[F]| -> bool {
+        if u.len()!=v.len() { return false; }
+        u.iter().zip(v.iter()).all(|(x,y)| {
+            let ux: f32 = (*x).to_f32();
+            let vy: f32 = (*y).to_f32();
+            (ux - vy).abs() < 1e-3 * f32::max(1.0, vy.abs())
+        })
+    };
+    println!("[rank2 f32 vec={}] add(1xN + MxN) ok? {}", vec, approx(out, &expect));
 }
