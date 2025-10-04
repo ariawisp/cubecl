@@ -23,6 +23,10 @@ pub struct MslBufferParam {
 pub struct Msl4Module {
     pub src: String,
     pub buffers: Vec<MslBufferParam>,
+    pub num_meta: u32,
+    pub has_metadata: bool,
+    pub output_index: Option<usize>,
+    pub output_line_size: u32,
 }
 
 impl core::fmt::Display for Msl4Module {
@@ -57,10 +61,17 @@ impl Compiler for Msl4Compiler {
         for (i, buf) in kernel.buffers.iter().enumerate() {
             let ty = msl_scalar_type(buf.ty.storage_type());
             let aspace = match buf.visibility { cubecl_core::compute::Visibility::Read => "constant", cubecl_core::compute::Visibility::ReadWrite => "device" };
+            // Proper MTLTensor path: typed tensor params for rank-1
             params.push(format!("tensor<{aspace} {ty}, dextents<int, 1>> b{i} [[ buffer({i}) ]]"));
         }
-        // Optional: add a dummy metadata binding if present (not used)
-        // The runtime binds metadata after buffers; shaders may ignore extra argument table entries.
+        // Metadata binding: when present, expose as a raw constant u32 array
+        // Layout follows cubecl-core/src/codegen/metadata.rs
+        let num_meta = kernel.buffers.len() as u32;
+        let has_metadata = num_meta > 0;
+        if has_metadata {
+            // Metadata is bound right after the last buffer index
+            params.push(format!("constant uint* __meta [[ buffer({}) ]]", num_meta));
+        }
 
         let param_list = if params.is_empty() {
             // MSL requires at least the thread index param
@@ -83,24 +94,72 @@ impl Compiler for Msl4Compiler {
                 cubecl_core::compute::Visibility::ReadWrite => outputs_idx.push(i),
             }
         }
+        // Determine output vectorization factor (line size) if any
+        let (output_index, output_line_size) = if let Some(&dst) = outputs_idx.first() {
+            let ls = kernel.buffers[dst].ty.line_size();
+            (Some(dst), if ls == 0 { 1 } else { ls })
+        } else { (None, 1) };
 
         // Emit basic elementwise on buffers (use operator[] for tensors)
-        let body = if inputs_idx.len() >= 2 && !outputs_idx.is_empty() {
-            let a = inputs_idx[0];
-            let b = inputs_idx[1];
-            let dst = outputs_idx[0];
-            format!(
-                "    size_t idx = tid.x;\n    b{dst}[idx] = b{a}[idx] + b{b}[idx];\n"
-            )
-        } else if inputs_idx.len() == 1 && !outputs_idx.is_empty() {
-            // Copy input to output when only one input is present
-            let src = inputs_idx[0];
-            let dst = outputs_idx[0];
-            format!(
-                "    size_t idx = tid.x;\n    b{dst}[idx] = b{src}[idx];\n"
-            )
+        // Vectorized per-lane loop guarded by logical length from metadata
+        let body = if let Some(dst) = output_index {
+            let header = if has_metadata {
+                format!(
+                    "    const uint LINE = {}u;\n    const size_t base = tid.x * LINE;\n    const uint __len = __meta[{}u + {}u];\n",
+                    output_line_size,
+                    num_meta, // LENGTH block starts at offset num_meta
+                    dst as u32,
+                )
+            } else {
+                format!(
+                    "    const uint LINE = {}u;\n    const size_t base = tid.x * LINE;\n",
+                    output_line_size
+                )
+            };
+
+            if inputs_idx.len() >= 2 {
+                let a = inputs_idx[0];
+                let b = inputs_idx[1];
+                if has_metadata {
+                    format!(
+                        "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        if (idx < __len) {{ b{dst}[idx] = b{a}[idx] + b{b}[idx]; }}\n    }}\n",
+                        header = header,
+                        dst = dst,
+                        a = a,
+                        b = b,
+                    )
+                } else {
+                    format!(
+                        "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        b{dst}[idx] = b{a}[idx] + b{b}[idx];\n    }}\n",
+                        header = header,
+                        dst = dst,
+                        a = a,
+                        b = b,
+                    )
+                }
+            } else if inputs_idx.len() == 1 {
+                let src = inputs_idx[0];
+                if has_metadata {
+                    format!(
+                        "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        if (idx < __len) {{ b{dst}[idx] = b{src}[idx]; }}\n    }}\n",
+                        header = header,
+                        dst = dst,
+                        src = src,
+                    )
+                } else {
+                    format!(
+                        "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        b{dst}[idx] = b{src}[idx];\n    }}\n",
+                        header = header,
+                        dst = dst,
+                        src = src,
+                    )
+                }
+            } else {
+                "    // TODO: IR→MSL lowering.\n".to_string()
+            }
         } else {
-            "    // TODO: IR→MSL lowering.\n".to_string()
+            // No outputs: nothing to do
+            "    // No outputs bound.\n".to_string()
         };
 
         let src = format!(
@@ -121,7 +180,14 @@ impl Compiler for Msl4Compiler {
             })
             .collect();
 
-        Msl4Module { src, buffers }
+        Msl4Module {
+            src,
+            buffers,
+            num_meta,
+            has_metadata,
+            output_index,
+            output_line_size: output_line_size.max(1),
+        }
     }
 
     fn elem_size(&self, elem: ElemType) -> usize { elem.size() }

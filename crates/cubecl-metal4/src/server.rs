@@ -60,6 +60,8 @@ pub struct Metal4Server {
     fence_value: u64,
     // May reuse a command buffer in future; currently create per-dispatch
     pipelines: HashMap<KernelId, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
+    /// Whether to allow pointer fallback if tensor creation fails (env-gated).
+    allow_pointer_fallback: bool,
 }
 
 // Mark server Send/Sync: Metal device/queue are safe to share across threads for command creation.
@@ -75,9 +77,15 @@ impl Metal4Server {
     ) -> Self {
         let _config = GlobalConfig::get();
         let device = MTLCreateSystemDefaultDevice().expect("No Metal device available");
-        let queue = device
-            .newMTL4CommandQueue()
-            .expect("Failed to create MTL4CommandQueue");
+        // Detect MTL4 support; fail fast with a clear message if unavailable
+        let queue = match device.newMTL4CommandQueue() {
+            Some(q) => q,
+            None => {
+                panic!(
+                    "Metal 4 unsupported on this device/OS. Enable an alternate runtime (e.g., WGPU) or provide a Metal 3 path."
+                );
+            }
+        };
         // Create a residency set and add it to the queue (keeps allocations resident)
         let res_desc = MTLResidencySetDescriptor::new();
         let residency = device
@@ -91,6 +99,7 @@ impl Metal4Server {
         let mm_props = MMProps { max_page_size: memory_properties.max_page_size, alignment: memory_properties.alignment };
         let storage = Metal4Storage::new(device.clone(), alignment);
         let mem_manage = MemoryManagement::from_configuration(storage, &mm_props, memory_config.clone());
+        let allow_pointer_fallback = std::env::var("CUBECL_MTL4_POINTER_FALLBACK").ok().map(|v| v == "1" || v.to_lowercase()=="true").unwrap_or(false);
         Self {
             logger,
             timing_method,
@@ -103,6 +112,7 @@ impl Metal4Server {
             event,
             fence_value: 0,
             pipelines: HashMap::new(),
+            allow_pointer_fallback,
         }
     }
 }
@@ -398,15 +408,9 @@ impl ComputeServer for Metal4Server {
         let meta_bind_count = if bindings.metadata.data.is_empty() { 0 } else { 1 };
         let buf_bind_count = bindings.buffers.len() + scalar_bind_count + meta_bind_count;
         let at_desc = MTL4ArgumentTableDescriptor::new();
-        // For non-MPP elementwise kernels, bind only the user buffers
-        let only_buffers = !use_mpp;
-        if only_buffers {
-            at_desc.setMaxBufferBindCount(bindings.buffers.len() as NSUInteger);
-            at_desc.setMaxTextureBindCount(0);
-            at_desc.setMaxSamplerStateBindCount(0);
-        } else {
-            at_desc.setMaxBufferBindCount(buf_bind_count as NSUInteger);
-        }
+        // Bind buffers + metadata + scalars for all kernels
+        let only_buffers = false;
+        at_desc.setMaxBufferBindCount(buf_bind_count as NSUInteger);
         if let Ok(arg_table) = self.device.newArgumentTableWithDescriptor_error(&at_desc) {
             // 1) Bind inputs: for MPP use tensors via resource IDs; otherwise bind buffer GPU addresses
             let mut next_index = 0usize;
@@ -420,110 +424,60 @@ impl ComputeServer for Metal4Server {
             let ranks_start = 2 * total_bufs;
             let shape_offs_start = ranks_start + num_ext;
             let stride_offs_start = ranks_start + num_ext * 2;
-            let mut ext_seen = 0usize;
             for (i, b) in bindings.buffers.iter().enumerate() {
                 let br = self.get_resource(b.clone(), _stream_id);
                 let res = br.resource();
-                let storage_id = res.storage_id.clone();
                 let storage_ref = self.mem_manage.storage();
-                if let Some(buf) = storage_ref.get_buffer(&storage_id) {
-                    // Build typed tensor descriptor from compiler info + metadata
-                    let info = buf_info.and_then(|bi| bi.get(i));
-                    let dtype = info.and_then(|p| map_elem_type_to_tensor_dtype(p.elem)).unwrap_or(MTLTensorDataType::UInt8);
-                    let elem_size = info.map(|p| elem_size_bytes(p.elem)).unwrap_or(1);
-                    // Prefer rank-2 for MPP when extended metadata is present
-                    let (rank, dims, strides) = if use_mpp {
-                        if let (Some(_p), true) = (info, info.map(|p| p.has_extended_meta).unwrap_or(false)) {
-                            if num_ext > 0 && data.len() > stride_offs_start {
-                                let ext_idx = ext_seen;
-                                ext_seen += 1;
-                                let r = data[ranks_start + ext_idx] as usize;
-                                let shape_base = data[shape_offs_start + ext_idx] as usize;
-                                let stride_base = data[stride_offs_start + ext_idx] as usize;
-                                let mut shape_vals = Vec::with_capacity(r);
-                                let mut stride_vals = Vec::with_capacity(r);
-                                for d in 0..r {
-                                    shape_vals.push(data[shape_base + d] as NSInteger);
-                                    stride_vals.push(data[stride_base + d] as NSInteger);
-                                }
-                                let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), r as NSUInteger, shape_vals.as_ptr()) }.expect("extents");
-                                let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), r as NSUInteger, stride_vals.as_ptr()) }.expect("strides");
-                                (r, dims, strides)
-                            } else {
-                                // Fallback to 1D
-                                let len = if data.len() >= total_bufs * 2 { data[total_bufs + i] as NSInteger } else { (b.size() as usize) as NSInteger };
-                                let shape_vals = [len];
-                                let stride_vals = [1 as NSInteger];
-                                let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }.expect("extents");
-                                let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }.expect("strides");
-                                (1usize, dims, strides)
-                            }
-                        } else {
-                            // No extended meta; 1D fallback
-                            let len = if data.len() >= total_bufs * 2 { data[total_bufs + i] as NSInteger } else { ((b.size() as usize) / elem_size) as NSInteger };
-                            let shape_vals = [len];
-                            let stride_vals = [1 as NSInteger];
-                            let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }.expect("extents");
-                            let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }.expect("strides");
-                            (1usize, dims, strides)
-                        }
-                    } else {
-                        // Default 1D tensor using logical length
-                        let len = if data.len() >= total_bufs * 2 { data[total_bufs + i] as NSInteger } else { ((b.size() as usize) / elem_size) as NSInteger };
-                        let shape_vals = [len];
-                        let stride_vals = [1 as NSInteger];
-                        let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }.expect("extents");
-                        let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }.expect("strides");
-                    (1usize, dims, strides)
-                    };
-                    let td = MTLTensorDescriptor::new();
-                    td.setDimensions(&dims);
-                    td.setStrides(Some(&strides));
-                    td.setUsage(MTLTensorUsage::Compute);
-                    td.setDataType(dtype);
-                    let offset = (res.offset as u64) as NSUInteger;
-                    #[cfg(debug_assertions)]
-                    unsafe {
-                        let rank = dims.rank() as usize;
-                        let e0 = if rank > 0 { dims.extentAtDimensionIndex(0) } else { 0 };
-                        println!(
-                            "[cubecl-metal4] tensor slot {} rank={} extent0={} offset={} bytes",
-                            next_index, rank, e0, offset
-                        );
-                    }
-                    match unsafe { buf.newTensorWithDescriptor_offset_error(&td, offset) } {
-                        Ok(tensor) => {
-                            let rid = tensor.gpuResourceID();
-                            #[cfg(debug_assertions)]
-                            println!("[cubecl-metal4] bound tensor at slot {} (dtype {:?})", next_index, dtype);
-                            unsafe { arg_table.setResource_atBufferIndex(rid, next_index as NSUInteger) };
-                            // Add tensor and underlying buffer allocations to residency set
-                            unsafe {
-                                let tensor_alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLTensor>, &ProtocolObject<dyn MTLAllocation>>(tensor.as_ref());
-                                self.residency.addAllocation(tensor_alloc);
-                            }
-                            if let Some(underlying) = tensor.buffer() {
-                                unsafe {
-                                    let alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLBuffer>, &ProtocolObject<dyn MTLAllocation>>(underlying.as_ref());
-                                    self.residency.addAllocation(alloc);
-                                }
-                            }
-                        }
-                        Err(_) => {
-                            // If tensor creation fails, fall back to address binding (best effort)
-                            let addr = (res.gpu_address as usize + res.offset) as MTLGPUAddress;
-                            #[cfg(debug_assertions)]
-                            println!("[cubecl-metal4] tensor failed; bound address at slot {}", next_index);
-                            unsafe { arg_table.setAddress_atIndex(addr, next_index as NSUInteger) };
-                            unsafe {
-                                let alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLBuffer>, &ProtocolObject<dyn MTLAllocation>>(buf.as_ref());
-                                self.residency.addAllocation(alloc);
-                            }
-                        }
-                    }
+                let Some(buf) = storage_ref.get_buffer(&res.storage_id) else {
+                    eprintln!("[cubecl-metal4] ERROR: Missing underlying MTLBuffer for storage id; aborting binding.");
+                    return;
+                };
+                let info = buf_info.and_then(|bi| bi.get(i));
+                let dtype = info.and_then(|p| map_elem_type_to_tensor_dtype(p.elem)).unwrap_or(MTLTensorDataType::UInt8);
+                let elem_size = info.map(|p| elem_size_bytes(p.elem)).unwrap_or(1) as u64;
+                let len: NSInteger = if data.len() >= total_bufs * 2 {
+                    data[total_bufs + i] as NSInteger
                 } else {
-                    let addr = (res.gpu_address as usize + res.offset) as MTLGPUAddress;
-                    unsafe { arg_table.setAddress_atIndex(addr, next_index as NSUInteger) };
+                    ((res.size - res.offset as u64) / elem_size) as NSInteger
+                };
+                let shape_vals = [len];
+                let stride_vals = [1 as NSInteger];
+                let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
+                    .expect("extents");
+                let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }
+                    .expect("strides");
+                let td = MTLTensorDescriptor::new();
+                td.setDimensions(&dims);
+                td.setStrides(Some(&strides));
+                td.setUsage(MTLTensorUsage::Compute);
+                td.setDataType(dtype);
+                let offset = (res.offset as u64) as NSUInteger;
+                let tensor = match unsafe { buf.newTensorWithDescriptor_offset_error(&td, offset) } {
+                    Ok(t) => t,
+                    Err(_) => {
+                        if self.allow_pointer_fallback {
+                            let addr = (res.gpu_address as usize + res.offset) as MTLGPUAddress;
+                            unsafe { arg_table.setAddress_atIndex(addr, next_index as NSUInteger) };
+                            next_index += 1;
+                            continue;
+                        } else {
+                            eprintln!("[cubecl-metal4] ERROR: Failed to create MTLTensor for slot {}.", next_index);
+                            return;
+                        }
+                    }
+                };
+                let rid = tensor.gpuResourceID();
+                unsafe { arg_table.setResource_atBufferIndex(rid, next_index as NSUInteger) };
+                // Residency for tensor and underlying buffer
+                unsafe {
+                    let tensor_alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLTensor>, &ProtocolObject<dyn MTLAllocation>>(tensor.as_ref());
+                    self.residency.addAllocation(tensor_alloc);
+                }
+                if let Some(underlying) = tensor.buffer() {
+                    unsafe {
+                        let alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLBuffer>, &ProtocolObject<dyn MTLAllocation>>(underlying.as_ref());
+                        self.residency.addAllocation(alloc);
+                    }
                 }
                 next_index += 1;
             }
@@ -533,8 +487,42 @@ impl ComputeServer for Metal4Server {
 
             if !only_buffers {
                 // 2) Pack and bind metadata (u32 words)
-                if !bindings.metadata.data.is_empty() {
-                    let meta_bytes: &[u8] = bytemuck::cast_slice(&bindings.metadata.data);
+                // Synthesize base metadata if missing for elementwise kernels
+                let mut synthesized: Option<Vec<u32>> = None;
+                let meta_slice: &[u32] = if bindings.metadata.data.is_empty() {
+                    if let Some(module) = compile.repr.as_ref() {
+                        // base metadata: [buffer_lens[N]] [logical_lengths[N]]
+                        let total = bindings.buffers.len();
+                        if total > 0 {
+                            let mut v: Vec<u32> = Vec::with_capacity(total * 2);
+                            // buffer lengths from resource size
+                            for (i, bnd) in bindings.buffers.iter().enumerate() {
+                                let br = self.get_resource(bnd.clone(), _stream_id);
+                                let res = br.resource();
+                                let elem = module.buffers.get(i).map(|b| b.elem);
+                                let esz = elem.map(elem_size_bytes).unwrap_or(1) as u64;
+                                let len = ((res.size - res.offset as u64) / esz) as u32;
+                                v.push(len);
+                            }
+                            // logical lengths == buffer lengths (best-effort)
+                            for i in 0..total {
+                                let len = v[i] as u32;
+                                v.push(len);
+                            }
+                            synthesized = Some(v);
+                        }
+                    }
+                    synthesized.as_deref().unwrap_or(&[])
+                } else {
+                    &bindings.metadata.data
+                };
+
+                if !meta_slice.is_empty() {
+                    #[cfg(debug_assertions)]
+                    {
+                        println!("[cubecl-metal4] meta buffer_lens={:?} lengths={:?}", &meta_slice[0..bindings.buffers.len()], &meta_slice[bindings.buffers.len()..(bindings.buffers.len()*2)]);
+                    }
+                    let meta_bytes: &[u8] = bytemuck::cast_slice(meta_slice);
                     let meta_handle = match self.create_with_data(meta_bytes, _stream_id) {
                         Ok(h) => h,
                         Err(_) => return,
@@ -543,6 +531,14 @@ impl ComputeServer for Metal4Server {
                     let res = br.resource();
                     let addr = (res.gpu_address as usize + res.offset) as MTLGPUAddress;
                     unsafe { arg_table.setAddress_atIndex(addr, next_index as NSUInteger) };
+                    // Ensure residency for metadata buffer
+                    let storage_ref = self.mem_manage.storage();
+                    if let Some(buf) = storage_ref.get_buffer(&res.storage_id) {
+                        unsafe {
+                            let alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLBuffer>, &ProtocolObject<dyn MTLAllocation>>(buf.as_ref());
+                            self.residency.addAllocation(alloc);
+                        }
+                    }
                     next_index += 1;
                 }
 
@@ -558,6 +554,14 @@ impl ComputeServer for Metal4Server {
                     let res = br.resource();
                     let addr = (res.gpu_address as usize + res.offset) as MTLGPUAddress;
                     unsafe { arg_table.setAddress_atIndex(addr, next_index as NSUInteger) };
+                    // Ensure residency for scalar buffer
+                    let storage_ref = self.mem_manage.storage();
+                    if let Some(buf) = storage_ref.get_buffer(&res.storage_id) {
+                        unsafe {
+                            let alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLBuffer>, &ProtocolObject<dyn MTLAllocation>>(buf.as_ref());
+                            self.residency.addAllocation(alloc);
+                        }
+                    }
                     next_index += 1;
                 }
             }
@@ -567,12 +571,9 @@ impl ComputeServer for Metal4Server {
         }
 
         // Compute grid and threads
-        let (mut gx, mut gy, gz) = match count {
-            CubeCount::Static(x, y, z) => (x as usize, y as usize, z as usize),
-            CubeCount::Dynamic(_) => (1, 1, 1),
-        };
         let mut threads = MTLSize { width: compile.cube_dim.x as usize, height: compile.cube_dim.y as usize, depth: compile.cube_dim.z as usize };
-        let mut grid = MTLSize { width: gx, height: gy, depth: gz };
+        let mut groups = MTLSize { width: 1, height: 1, depth: 1 };
+
         // For MPP matmul kernels, infer grid from output tensor shape: grid.x = ceil(N/32), grid.y = ceil(M/64)
         let mpp = kernel.name().contains("mpp_matmul_2d") || compile.entrypoint_name.as_str() == "mpp_matmul_2d";
         if mpp {
@@ -586,50 +587,64 @@ impl ComputeServer for Metal4Server {
                     let data = &bindings.metadata.data;
                     // Compute ext_idx for buffer 2
                     let mut ext_idx = 0usize;
-                    for k in 0..2 {
-                        if module.buffers.get(k).map(|p| p.has_extended_meta).unwrap_or(false) { ext_idx += 1; }
-                    }
+                    for k in 0..2 { if module.buffers.get(k).map(|p| p.has_extended_meta).unwrap_or(false) { ext_idx += 1; } }
                     if ext_idx < num_ext && data.len() > shape_offs_start + ext_idx {
                         let shape_base = data[shape_offs_start + ext_idx] as usize;
                         if shape_base + 1 < data.len() {
                             let n = data[shape_base + 0] as usize; // innermost
                             let m = data[shape_base + 1] as usize; // outer
                             let tile_m = 64usize; let tile_n = 32usize;
-                            gx = (n + tile_n - 1) / tile_n;
-                            gy = (m + tile_m - 1) / tile_m;
-                            grid = MTLSize { width: gx, height: gy, depth: 1 };
+                            let gx = (n + tile_n - 1) / tile_n;
+                            let gy = (m + tile_m - 1) / tile_m;
+                            groups = MTLSize { width: gx.max(1), height: gy.max(1), depth: 1 };
                             threads = MTLSize { width: 1, height: 1, depth: 1 };
                         }
                     }
                 }
             }
-        }
-        // For elementwise kernels (non-MPP), default to 1D grid sized to first writeable buffer length
-        if !mpp {
+        } else {
+            // Elementwise kernels (non-MPP): 1D outer work-items equal to ceil(len / line)
             if let Some(module) = compile.repr.as_ref() {
                 let total_bufs = bindings.buffers.len();
-                let data = &bindings.metadata.data;
-                // Find first writeable buffer index
-                if let Some((i, _)) = module.buffers.iter().enumerate().find(|(_, p)| p.is_writeable) {
-                    let len = if data.len() >= total_bufs * 2 { data[total_bufs + i] as usize } else { 0 };
-                    if len > 0 {
-                        gx = len; gy = 1;
-                        grid = MTLSize { width: gx, height: gy, depth: 1 };
-                        threads = MTLSize { width: 1, height: 1, depth: 1 };
+                // Prefer synthesized meta if present above; otherwise, use provided metadata
+                let data_ref: &[u32] = if bindings.metadata.data.is_empty() {
+                    // Base metadata synthesized mirrors binding order; rebuild in place for sizing
+                    let mut tmp: Vec<u32> = Vec::with_capacity(total_bufs * 2);
+                    for (i, bnd) in bindings.buffers.iter().enumerate() {
+                        let br = self.get_resource(bnd.clone(), _stream_id);
+                        let res = br.resource();
+                        let elem = module.buffers.get(i).map(|b| b.elem);
+                        let esz = elem.map(elem_size_bytes).unwrap_or(1) as u64;
+                        let len = ((res.size - res.offset as u64) / esz) as u32;
+                        tmp.push(len);
                     }
+                    for i in 0..total_bufs { let l = tmp[i]; tmp.push(l); }
+                    // Store in a local and then borrow; scope ends at dispatch
+                    // To keep borrow live until dispatch, move into a Box
+                    let boxed = tmp.into_boxed_slice();
+                    let slice: &'static [u32] = Box::leak(boxed);
+                    slice
+                } else {
+                    &bindings.metadata.data
+                };
+                if let Some((i, _)) = module.buffers.iter().enumerate().find(|(_, p)| p.is_writeable) {
+                    let len = if data_ref.len() >= total_bufs * 2 { data_ref[total_bufs + i] as usize } else { 0 };
+                    let line = if module.output_line_size > 0 { module.output_line_size as usize } else { 1 };
+                    let items = if len > 0 { (len + line - 1) / line } else { 0 };
+                    // Choose a simple threadgroup size and grid
+                    let tg_w = if items >= 64 { 64 } else if items >= 32 { 32 } else if items >= 16 { 16 } else if items >= 8 { 8 } else { items.max(1) };
+                    threads = MTLSize { width: tg_w, height: 1, depth: 1 };
+                    groups = MTLSize { width: (items + tg_w - 1) / tg_w, height: 1, depth: 1 };
                 }
             }
         }
-        // Prefer dispatchThreadgroups; choose a simple threadgroup size and grid
-        let tg_w = if gx >= 64 { 64 } else if gx >= 32 { 32 } else if gx >= 16 { 16 } else if gx >= 8 { 8 } else { gx.max(1) };
-        let threadgroup = MTLSize { width: tg_w, height: 1, depth: 1 };
-        let groups = MTLSize { width: (gx + tg_w - 1) / tg_w, height: gy, depth: gz };
+        // Prefer dispatchThreadgroups; use computed groups/threads
         #[cfg(debug_assertions)]
         println!(
             "[cubecl-metal4] dispatchThreadgroups groups=({}, {}, {}), tg=({}, {}, {})",
-            groups.width, groups.height, groups.depth, threadgroup.width, threadgroup.height, threadgroup.depth
+            groups.width, groups.height, groups.depth, threads.width, threads.height, threads.depth
         );
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threadgroup);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
         encoder.endEncoding();
         // Flush residency changes
         self.residency.commit();
