@@ -423,7 +423,7 @@ impl ComputeServer for Metal4Server {
             let num_ext = buf_info.map(|bi| bi.iter().filter(|p| p.has_extended_meta).count()).unwrap_or(0);
             let ranks_start = 2 * total_bufs;
             let shape_offs_start = ranks_start + num_ext;
-            let stride_offs_start = ranks_start + num_ext * 2;
+            let stride_offs_start = shape_offs_start + num_ext;
             for (i, b) in bindings.buffers.iter().enumerate() {
                 let br = self.get_resource(b.clone(), _stream_id);
                 let res = br.resource();
@@ -435,17 +435,84 @@ impl ComputeServer for Metal4Server {
                 let info = buf_info.and_then(|bi| bi.get(i));
                 let dtype = info.and_then(|p| map_elem_type_to_tensor_dtype(p.elem)).unwrap_or(MTLTensorDataType::UInt8);
                 let elem_size = info.map(|p| elem_size_bytes(p.elem)).unwrap_or(1) as u64;
-                let len: NSInteger = if data.len() >= total_bufs * 2 {
-                    data[total_bufs + i] as NSInteger
+                // Prefer extended metadata rank/shape/strides when available
+                let (dims, strides) = if info.map(|p| p.has_extended_meta).unwrap_or(false)
+                    && data.len() >= stride_offs_start
+                {
+                    // ext_idx = number of previous buffers with extended meta
+                    let mut ext_idx = 0usize;
+                    if let Some(bi) = buf_info {
+                        for k in 0..i {
+                            if bi.get(k).map(|p| p.has_extended_meta).unwrap_or(false) {
+                                ext_idx += 1;
+                            }
+                        }
+                    }
+                    if ext_idx < num_ext {
+                        let rank = data.get(ranks_start + ext_idx).copied().unwrap_or(1) as usize;
+                        let shape_base = data.get(shape_offs_start + ext_idx).copied().unwrap_or(0) as usize;
+                        let stride_base = data.get(stride_offs_start + ext_idx).copied().unwrap_or(0) as usize;
+                        if shape_base + rank <= data.len() && stride_base + rank <= data.len() && rank > 0 {
+                            let mut shape_vals: Vec<NSInteger> = (0..rank)
+                                .map(|d| data[shape_base + d] as NSInteger)
+                                .collect();
+                            let mut stride_vals: Vec<NSInteger> = (0..rank)
+                                .map(|d| data[stride_base + d] as NSInteger)
+                                .collect();
+                            if shape_vals.is_empty() {
+                                shape_vals.push(((res.size - res.offset as u64) / elem_size) as NSInteger);
+                            }
+                            if stride_vals.is_empty() { stride_vals.push(1 as NSInteger); }
+                            let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), rank as NSUInteger, shape_vals.as_ptr()) }
+                                .expect("extents");
+                            let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), rank as NSUInteger, stride_vals.as_ptr()) }
+                                .expect("strides");
+                            (dims, strides)
+                        } else {
+                            // Fallback to rank-1
+                            let len: NSInteger = if data.len() >= total_bufs * 2 {
+                                data[total_bufs + i] as NSInteger
+                            } else {
+                                ((res.size - res.offset as u64) / elem_size) as NSInteger
+                            };
+                            let shape_vals = [len];
+                            let stride_vals = [1 as NSInteger];
+                            let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
+                                .expect("extents");
+                            let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }
+                                .expect("strides");
+                            (dims, strides)
+                        }
+                    } else {
+                        // Fallback to rank-1
+                        let len: NSInteger = if data.len() >= total_bufs * 2 {
+                            data[total_bufs + i] as NSInteger
+                        } else {
+                            ((res.size - res.offset as u64) / elem_size) as NSInteger
+                        };
+                        let shape_vals = [len];
+                        let stride_vals = [1 as NSInteger];
+                        let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
+                            .expect("extents");
+                        let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }
+                            .expect("strides");
+                        (dims, strides)
+                    }
                 } else {
-                    ((res.size - res.offset as u64) / elem_size) as NSInteger
+                    // Rank-1 default
+                    let len: NSInteger = if data.len() >= total_bufs * 2 {
+                        data[total_bufs + i] as NSInteger
+                    } else {
+                        ((res.size - res.offset as u64) / elem_size) as NSInteger
+                    };
+                    let shape_vals = [len];
+                    let stride_vals = [1 as NSInteger];
+                    let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
+                        .expect("extents");
+                    let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }
+                        .expect("strides");
+                    (dims, strides)
                 };
-                let shape_vals = [len];
-                let stride_vals = [1 as NSInteger];
-                let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
-                    .expect("extents");
-                let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }
-                    .expect("strides");
                 let td = MTLTensorDescriptor::new();
                 td.setDimensions(&dims);
                 td.setStrides(Some(&strides));
@@ -489,6 +556,7 @@ impl ComputeServer for Metal4Server {
                 // 2) Pack and bind metadata (u32 words)
                 // Synthesize base metadata if missing for elementwise kernels
                 let mut synthesized: Option<Vec<u32>> = None;
+                // Prepare metadata slice; if present, adjust logical lengths to scalar lengths for MSL4 per-lane guards
                 let meta_slice: &[u32] = if bindings.metadata.data.is_empty() {
                     if let Some(module) = compile.repr.as_ref() {
                         // base metadata: [buffer_lens[N]] [logical_lengths[N]]
@@ -501,7 +569,12 @@ impl ComputeServer for Metal4Server {
                                 let res = br.resource();
                                 let elem = module.buffers.get(i).map(|b| b.elem);
                                 let esz = elem.map(elem_size_bytes).unwrap_or(1) as u64;
-                                let len = ((res.size - res.offset as u64) / esz) as u32;
+                            let len = (res.size / esz) as u32;
+                                #[cfg(debug_assertions)]
+                                println!(
+                                    "[cubecl-metal4] synth meta buf#{i}: size={} off={} esz={} -> len={}",
+                                    res.size, res.offset, esz, len
+                                );
                                 v.push(len);
                             }
                             // logical lengths == buffer lengths (best-effort)
@@ -514,7 +587,23 @@ impl ComputeServer for Metal4Server {
                     }
                     synthesized.as_deref().unwrap_or(&[])
                 } else {
-                    &bindings.metadata.data
+                    // Adjust lengths (second block) to scalar element counts based on bound resources
+                    let mut meta = bindings.metadata.data.clone();
+                    if let Some(module) = compile.repr.as_ref() {
+                        let total = bindings.buffers.len();
+                        for (i, bnd) in bindings.buffers.iter().enumerate() {
+                            let br = self.get_resource(bnd.clone(), _stream_id);
+                            let res = br.resource();
+                            let elem = module.buffers.get(i).map(|b| b.elem);
+                            let esz = elem.map(elem_size_bytes).unwrap_or(1) as u64;
+                            let scalar_len = (res.size / esz) as u32;
+                            if meta.len() > total + i { meta[total + i] = scalar_len; }
+                        }
+                    }
+                    // Leak adjusted vector for lifetime of dispatch
+                    let boxed = meta.into_boxed_slice();
+                    let slice: &'static [u32] = Box::leak(boxed);
+                    slice
                 };
 
                 if !meta_slice.is_empty() {
@@ -542,7 +631,33 @@ impl ComputeServer for Metal4Server {
                     next_index += 1;
                 }
 
-                // 3) Pack and bind scalars (u64 units)
+                // 3) Bind auxiliary out_len scalar for elementwise guard
+                if let Some(m) = module {
+                    if let Some((oi, _)) = m.buffers.iter().enumerate().find(|(_,p)| p.is_writeable) {
+                        let br = self.get_resource(bindings.buffers[oi].clone(), _stream_id);
+                        let res = br.resource();
+                        let elem = m.buffers.get(oi).map(|b| b.elem);
+                        let esz = elem.map(elem_size_bytes).unwrap_or(1) as u64;
+                        let out_len: u32 = (res.size / esz) as u32;
+                        let out_len_arr = [out_len];
+                        let aux_bytes: &[u8] = bytemuck::cast_slice(&out_len_arr);
+                        if let Ok(h) = self.create_with_data(aux_bytes, _stream_id) {
+                            let br2 = self.get_resource(h.clone().binding(), _stream_id);
+                            let res2 = br2.resource();
+                            let addr2 = (res2.gpu_address as usize + res2.offset) as MTLGPUAddress;
+                            unsafe { arg_table.setAddress_atIndex(addr2, next_index as NSUInteger) };
+                            if let Some(buf2) = self.mem_manage.storage().get_buffer(&res2.storage_id) {
+                                unsafe {
+                                    let alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLBuffer>, &ProtocolObject<dyn MTLAllocation>>(buf2.as_ref());
+                                    self.residency.addAllocation(alloc);
+                                }
+                            }
+                            next_index += 1;
+                        }
+                    }
+                }
+
+                // 4) Pack and bind scalars (u64 units)
                 for s in bindings.scalars.values() {
                     let data_u64 = s.data();
                     let scalar_bytes: &[u8] = bytemuck::cast_slice(&data_u64);
@@ -615,7 +730,7 @@ impl ComputeServer for Metal4Server {
                         let res = br.resource();
                         let elem = module.buffers.get(i).map(|b| b.elem);
                         let esz = elem.map(elem_size_bytes).unwrap_or(1) as u64;
-                        let len = ((res.size - res.offset as u64) / esz) as u32;
+                        let len = (res.size / esz) as u32;
                         tmp.push(len);
                     }
                     for i in 0..total_bufs { let l = tmp[i]; tmp.push(l); }
@@ -625,7 +740,22 @@ impl ComputeServer for Metal4Server {
                     let slice: &'static [u32] = Box::leak(boxed);
                     slice
                 } else {
-                    &bindings.metadata.data
+                    // Use adjusted metadata as above
+                    let mut meta = bindings.metadata.data.clone();
+                    let total = bindings.buffers.len();
+                    if let Some(module) = compile.repr.as_ref() {
+                        for (i, bnd) in bindings.buffers.iter().enumerate() {
+                            let br = self.get_resource(bnd.clone(), _stream_id);
+                            let res = br.resource();
+                            let elem = module.buffers.get(i).map(|b| b.elem);
+                            let esz = elem.map(elem_size_bytes).unwrap_or(1) as u64;
+                            let scalar_len = (res.size / esz) as u32;
+                            if meta.len() > total + i { meta[total + i] = scalar_len; }
+                        }
+                    }
+                    let boxed = meta.into_boxed_slice();
+                    let slice: &'static [u32] = Box::leak(boxed);
+                    slice
                 };
                 if let Some((i, _)) = module.buffers.iter().enumerate().find(|(_, p)| p.is_writeable) {
                     let len = if data_ref.len() >= total_bufs * 2 { data_ref[total_bufs + i] as usize } else { 0 };

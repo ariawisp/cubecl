@@ -71,6 +71,8 @@ impl Compiler for Msl4Compiler {
         if has_metadata {
             // Metadata is bound right after the last buffer index
             params.push(format!("constant uint* __meta [[ buffer({}) ]]", num_meta));
+            // Auxiliary scalars (e.g., out_len)
+            params.push(format!("constant uint* __aux [[ buffer({}) ]]", num_meta + 1));
         }
 
         let param_list = if params.is_empty() {
@@ -100,15 +102,49 @@ impl Compiler for Msl4Compiler {
             (Some(dst), if ls == 0 { 1 } else { ls })
         } else { (None, 1) };
 
+        // Detect simple arithmetic op from IR (best-effort)
+        #[derive(Copy, Clone, Debug)]
+        enum OpKind { Add, Sub, Mul, Div, Neg, Abs, Exp, Log, Tanh, Sqrt, Floor, Ceil, Round }
+        let mut detected_op: Option<OpKind> = None;
+        for inst in &kernel.body.instructions {
+            if let cubecl_ir::Operation::Arithmetic(ar) = &inst.operation {
+                use cubecl_ir::Arithmetic::*;
+                detected_op = Some(match ar {
+                    Add(_) => OpKind::Add,
+                    Sub(_) => OpKind::Sub,
+                    Mul(_) => OpKind::Mul,
+                    Div(_) => OpKind::Div,
+                    Neg(_) => OpKind::Neg,
+                    Abs(_) => OpKind::Abs,
+                    Exp(_) => OpKind::Exp,
+                    Log(_) => OpKind::Log,
+                    Tanh(_) => OpKind::Tanh,
+                    Sqrt(_) => OpKind::Sqrt,
+                    Floor(_) => OpKind::Floor,
+                    Ceil(_) => OpKind::Ceil,
+                    Round(_) => OpKind::Round,
+                    _ => continue,
+                });
+                if detected_op.is_some() { break; }
+            }
+        }
+        if detected_op.is_none() {
+            let lname = name.to_lowercase();
+            if lname.contains("add_") || lname.starts_with("add_") { detected_op = Some(OpKind::Add); }
+            else if lname.contains("sub_") || lname.starts_with("sub_") { detected_op = Some(OpKind::Sub); }
+            else if lname.contains("mul_") || lname.starts_with("mul_") { detected_op = Some(OpKind::Mul); }
+            else if lname.contains("div_") || lname.starts_with("div_") { detected_op = Some(OpKind::Div); }
+            else if lname.contains("neg_") || lname.starts_with("neg_") { detected_op = Some(OpKind::Neg); }
+            else if lname.contains("abs_") || lname.starts_with("abs_") { detected_op = Some(OpKind::Abs); }
+        }
+
         // Emit basic elementwise on buffers (use operator[] for tensors)
         // Vectorized per-lane loop guarded by logical length from metadata
         let body = if let Some(dst) = output_index {
             let header = if has_metadata {
                 format!(
-                    "    const uint LINE = {}u;\n    const size_t base = tid.x * LINE;\n    const uint __len = __meta[{}u + {}u];\n",
+                    "    const uint LINE = {}u;\n    const size_t base = tid.x * LINE;\n    const uint __len = __aux[0];\n",
                     output_line_size,
-                    num_meta, // LENGTH block starts at offset num_meta
-                    dst as u32,
                 )
             } else {
                 format!(
@@ -117,45 +153,83 @@ impl Compiler for Msl4Compiler {
                 )
             };
 
-            if inputs_idx.len() >= 2 {
-                let a = inputs_idx[0];
-                let b = inputs_idx[1];
-                if has_metadata {
+            let guard_if = if has_metadata { Some("if (idx < __len) ") } else { None };
+            let gen_bin = |op: &str, a: usize, b: usize| -> String {
+                // Broadcasting: if an input logical length is 1, use index 0 for that input
+                let preface = if has_metadata {
                     format!(
-                        "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        if (idx < __len) {{ b{dst}[idx] = b{a}[idx] + b{b}[idx]; }}\n    }}\n",
-                        header = header,
-                        dst = dst,
-                        a = a,
-                        b = b,
+                        "    const uint __lenA = __meta[{}u + {}u];\n    const uint __lenB = __meta[{}u + {}u];\n",
+                        num_meta, a as u32, num_meta, b as u32
                     )
                 } else {
-                    format!(
-                        "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        b{dst}[idx] = b{a}[idx] + b{b}[idx];\n    }}\n",
-                        header = header,
-                        dst = dst,
-                        a = a,
-                        b = b,
-                    )
+                    String::new()
+                };
+                match guard_if {
+                    Some(pre) => format!(
+                        "{header}{preface}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const uint idx = (uint)(base + lane);\n        const uint ia = (__lenA == 1u) ? 0u : idx;\n        const uint ib = (__lenB == 1u) ? 0u : idx;\n        {pre}{{ b{dst}[idx] = b{a}[ia] {op} b{b}[ib]; }}\n    }}\n",
+                        header = header, preface = preface, pre = pre, dst = dst, a = a, b = b, op = op
+                    ),
+                    None => format!(
+                        "{header}{preface}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const uint idx = (uint)(base + lane);\n        const uint ia = (__lenA == 1u) ? 0u : idx;\n        const uint ib = (__lenB == 1u) ? 0u : idx;\n        b{dst}[idx] = b{a}[ia] {op} b{b}[ib];\n    }}\n",
+                        header = header, preface = preface, dst = dst, a = a, b = b, op = op
+                    ),
                 }
-            } else if inputs_idx.len() == 1 {
-                let src = inputs_idx[0];
-                if has_metadata {
-                    format!(
-                        "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        if (idx < __len) {{ b{dst}[idx] = b{src}[idx]; }}\n    }}\n",
-                        header = header,
-                        dst = dst,
-                        src = src,
-                    )
+            };
+            let gen_un = |func: &str, a: usize| -> String {
+                if func.is_empty() {
+                    // copy
+                    match guard_if {
+                        Some(pre) => format!(
+                            "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        {pre}{{ b{dst}[idx] = b{a}[idx]; }}\n    }}\n",
+                            header = header, pre = pre, dst = dst, a = a
+                        ),
+                        None => format!(
+                            "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        b{dst}[idx] = b{a}[idx];\n    }}\n",
+                            header = header, dst = dst, a = a
+                        ),
+                    }
                 } else {
-                    format!(
-                        "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        b{dst}[idx] = b{src}[idx];\n    }}\n",
-                        header = header,
-                        dst = dst,
-                        src = src,
-                    )
+                    match guard_if {
+                        Some(pre) => format!(
+                            "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        {pre}{{ b{dst}[idx] = {func}(b{a}[idx]); }}\n    }}\n",
+                            header = header, pre = pre, dst = dst, a = a, func = func
+                        ),
+                        None => format!(
+                            "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        b{dst}[idx] = {func}(b{a}[idx]);\n    }}\n",
+                            header = header, dst = dst, a = a, func = func
+                        ),
+                    }
                 }
-            } else {
-                "    // TODO: IR→MSL lowering.\n".to_string()
+            };
+
+            match (inputs_idx.len(), detected_op) {
+                (2, Some(OpKind::Add)) => gen_bin("+", inputs_idx[0], inputs_idx[1]),
+                (2, Some(OpKind::Sub)) => gen_bin("-", inputs_idx[0], inputs_idx[1]),
+                (2, Some(OpKind::Mul)) => gen_bin("*", inputs_idx[0], inputs_idx[1]),
+                (2, Some(OpKind::Div)) => gen_bin("/", inputs_idx[0], inputs_idx[1]),
+                (1, Some(OpKind::Neg)) => {
+                    match guard_if {
+                        Some(pre) => format!(
+                            "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const uint idx = (uint)(base + lane);\n        {pre}{{ b{dst}[idx] = -b{a}[idx]; }}\n    }}\n",
+                            header = header, pre = pre, dst = dst, a = inputs_idx[0]
+                        ),
+                        None => format!(
+                            "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const uint idx = (uint)(base + lane);\n        b{dst}[idx] = -b{a}[idx];\n    }}\n",
+                            header = header, dst = dst, a = inputs_idx[0]
+                        ),
+                    }
+                }
+                (1, Some(OpKind::Abs)) => gen_un("abs", inputs_idx[0]),
+                (1, Some(OpKind::Exp)) => gen_un("exp", inputs_idx[0]),
+                (1, Some(OpKind::Log)) => gen_un("log", inputs_idx[0]),
+                (1, Some(OpKind::Tanh)) => gen_un("tanh", inputs_idx[0]),
+                (1, Some(OpKind::Sqrt)) => gen_un("sqrt", inputs_idx[0]),
+                (1, Some(OpKind::Floor)) => gen_un("floor", inputs_idx[0]),
+                (1, Some(OpKind::Ceil)) => gen_un("ceil", inputs_idx[0]),
+                (1, Some(OpKind::Round)) => gen_un("rint", inputs_idx[0]),
+                (2, None) | (2, _) => gen_bin("+", inputs_idx[0], inputs_idx[1]),
+                (1, None) | (1, _) => gen_un("", inputs_idx[0]),
+                _ => "    // TODO: IR→MSL lowering.\n".to_string(),
             }
         } else {
             // No outputs: nothing to do

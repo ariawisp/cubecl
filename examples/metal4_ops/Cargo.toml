@@ -1,0 +1,12 @@
+[package]
+name = "metal4_ops"
+version = "0.7.0"
+edition = "2024"
+
+[dependencies]
+cubecl = { path = "../../crates/cubecl", version = "0.7.0", default-features = false }
+
+[features]
+default = []
+metal4 = ["cubecl/metal4"]
+wgpu = ["cubecl/wgpu"]
