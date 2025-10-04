@@ -19,12 +19,16 @@ cubecl-core = { path = "../cubecl-core", version = "0.7.0" }
 cubecl-common = { path = "../cubecl-common", version = "0.7.0" }
 cubecl-runtime = { path = "../cubecl-runtime", version = "0.7.0" }
 cubecl-msl4 = { path = "../cubecl-msl4", version = "0.7.0" }
+cubecl-ir = { path = "../cubecl-ir", version = "0.7.0" }
 
 # objc2 Metal 4 stack (metal-safe branch)
 objc2 = { git = "https://github.com/madsmtm/objc2", rev = "325ff167465d74f0d5187b4b1b8b231d2be21efe", default-features = false, features = ["std"] }
 objc2-foundation = { git = "https://github.com/madsmtm/objc2", rev = "325ff167465d74f0d5187b4b1b8b231d2be21efe", package = "objc2-foundation", default-features = false, features = ["std","NSArray","NSString","NSError"] }
 objc2-metal = { git = "https://github.com/madsmtm/objc2", rev = "325ff167465d74f0d5187b4b1b8b231d2be21efe", package = "objc2-metal", default-features = false, features = [
     "std",
+    "MTLEvent",
+    "MTLAllocation",
+    "MTLResidencySet",
     "MTLTypes",
     "MTLResource",
     "MTLBuffer",
@@ -40,6 +44,7 @@ objc2-metal = { git = "https://github.com/madsmtm/objc2", rev = "325ff167465d74f
     "MTL4CompilerTask",
     "MTL4CommandQueue",
     "MTL4CommandBuffer",
+    "MTL4CommandAllocator",
     "MTL4ComputeCommandEncoder",
     "MTL4ArgumentTable",
     "MTL4CommandEncoder",
@@ -52,4 +57,6 @@ objc2-metal = { git = "https://github.com/madsmtm/objc2", rev = "325ff167465d74f
     "MTLTensor",
 ] }
 objc2-metal-performance-shaders = { git = "https://github.com/madsmtm/objc2", rev = "325ff167465d74f0d5187b4b1b8b231d2be21efe", package = "objc2-metal-performance-shaders", default-features = false, features = ["std","MPSMatrix","MPSNDArray","MPSMatrixMultiplication","MPSNDArrayMatrixMultiplication"] }
+objc2-core-graphics = { git = "https://github.com/madsmtm/objc2", rev = "325ff167465d74f0d5187b4b1b8b231d2be21efe", package = "objc2-core-graphics" }
 hashbrown = "0.15"
+bytemuck = { version = "1", features = ["extern_crate_std"] }

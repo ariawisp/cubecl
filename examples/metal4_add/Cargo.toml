@@ -1,0 +1,15 @@
+[package]
+name = "metal4_add"
+publish = false
+edition.workspace = true
+license.workspace = true
+version.workspace = true
+
+[features]
+default = []
+metal4 = ["cubecl/metal4"]
+
+[dependencies]
+cubecl = { path = "../../crates/cubecl", version = "0.7.0" }
+half = { workspace = true }
+
