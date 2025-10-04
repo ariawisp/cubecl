@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 cubecl = { path = "../../crates/cubecl", version = "0.7.0", default-features = false }
+half = { version = "2", default-features = false, features = ["num-traits"] }
+num-traits = "0.2"
 
 [features]
 default = []

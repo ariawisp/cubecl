@@ -104,7 +104,23 @@ impl Compiler for Msl4Compiler {
 
         // Detect simple arithmetic op from IR (best-effort)
         #[derive(Copy, Clone, Debug)]
-        enum OpKind { Add, Sub, Mul, Div, Neg, Abs, Exp, Log, Tanh, Sqrt, Floor, Ceil, Round }
+        enum OpKind {
+            Add,
+            Sub,
+            Mul,
+            Div,
+            Neg,
+            Abs,
+            Exp,
+            Log,
+            Log1p,
+            Recip,
+            Tanh,
+            Sqrt,
+            Floor,
+            Ceil,
+            Round,
+        }
         let mut detected_op: Option<OpKind> = None;
         for inst in &kernel.body.instructions {
             if let cubecl_ir::Operation::Arithmetic(ar) = &inst.operation {
@@ -123,6 +139,8 @@ impl Compiler for Msl4Compiler {
                     Floor(_) => OpKind::Floor,
                     Ceil(_) => OpKind::Ceil,
                     Round(_) => OpKind::Round,
+                    Log1p(_) => OpKind::Log1p,
+                    Recip(_) => OpKind::Recip,
                     _ => continue,
                 });
                 if detected_op.is_some() { break; }
@@ -222,6 +240,32 @@ impl Compiler for Msl4Compiler {
                 (1, Some(OpKind::Abs)) => gen_un("abs", inputs_idx[0]),
                 (1, Some(OpKind::Exp)) => gen_un("exp", inputs_idx[0]),
                 (1, Some(OpKind::Log)) => gen_un("log", inputs_idx[0]),
+                // log1p(x) ≈ log(1 + x)
+                (1, Some(OpKind::Log1p)) => {
+                    match guard_if {
+                        Some(pre) => format!(
+                            "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        {pre}{{ b{dst}[idx] = log(1.0 + b{a}[idx]); }}\n    }}\n",
+                            header = header, pre = pre, dst = dst, a = inputs_idx[0]
+                        ),
+                        None => format!(
+                            "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        b{dst}[idx] = log(1.0 + b{a}[idx]);\n    }}\n",
+                            header = header, dst = dst, a = inputs_idx[0]
+                        ),
+                    }
+                }
+                // recip(x) = 1 / x
+                (1, Some(OpKind::Recip)) => {
+                    match guard_if {
+                        Some(pre) => format!(
+                            "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        {pre}{{ b{dst}[idx] = 1.0 / b{a}[idx]; }}\n    }}\n",
+                            header = header, pre = pre, dst = dst, a = inputs_idx[0]
+                        ),
+                        None => format!(
+                            "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        b{dst}[idx] = 1.0 / b{a}[idx];\n    }}\n",
+                            header = header, dst = dst, a = inputs_idx[0]
+                        ),
+                    }
+                }
                 (1, Some(OpKind::Tanh)) => gen_un("tanh", inputs_idx[0]),
                 (1, Some(OpKind::Sqrt)) => gen_un("sqrt", inputs_idx[0]),
                 (1, Some(OpKind::Floor)) => gen_un("floor", inputs_idx[0]),

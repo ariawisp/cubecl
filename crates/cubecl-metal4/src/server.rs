@@ -27,7 +27,7 @@ use objc2_foundation::{NSString, NSInteger, NSUInteger};
 use objc2::AnyThread;
 use objc2_metal::MTLBuffer;
 use objc2_metal::{
-    MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandBuffer, MTL4CommandQueue,
+    MTL4ArgumentTable, MTL4ArgumentTableDescriptor, MTL4CommandAllocator, MTL4CommandBuffer, MTL4CommandQueue,
     MTL4CommandEncoder, MTL4Compiler, MTL4CompilerDescriptor, MTL4ComputeCommandEncoder, MTL4ComputePipelineDescriptor,
     MTL4FunctionDescriptor, MTL4LibraryFunctionDescriptor, MTLCommandEncoder, MTLCompileOptions,
     MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice as _, MTLGPUAddress, MTLLibrary,
@@ -58,7 +58,16 @@ pub struct Metal4Server {
     residency: Retained<ProtocolObject<dyn MTLResidencySet>>,
     event: Retained<ProtocolObject<dyn MTLSharedEvent>>,
     fence_value: u64,
-    // May reuse a command buffer in future; currently create per-dispatch
+    // Reuse a command buffer with a small allocator ring to reduce churn
+    cb: Option<Retained<ProtocolObject<dyn MTL4CommandBuffer>>>,
+    allocators: Vec<Retained<ProtocolObject<dyn MTL4CommandAllocator>>>,
+    frames_in_flight: usize,
+    frame_cursor: usize,
+    inflight_staging: Vec<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>,
+    inflight_fences: Vec<u64>,
+    inflight_tables: Vec<Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>>,
+    inflight_tensors: Vec<Vec<Retained<ProtocolObject<dyn MTLTensor>>>>,
+    // Pipeline cache
     pipelines: HashMap<KernelId, Retained<ProtocolObject<dyn MTLComputePipelineState>>>,
     /// Whether to allow pointer fallback if tensor creation fails (env-gated).
     allow_pointer_fallback: bool,
@@ -100,6 +109,18 @@ impl Metal4Server {
         let storage = Metal4Storage::new(device.clone(), alignment);
         let mem_manage = MemoryManagement::from_configuration(storage, &mm_props, memory_config.clone());
         let allow_pointer_fallback = std::env::var("CUBECL_MTL4_POINTER_FALLBACK").ok().map(|v| v == "1" || v.to_lowercase()=="true").unwrap_or(false);
+        // Create a reusable command buffer and allocator ring
+        let cb = device.newCommandBuffer();
+        let mut allocators: Vec<Retained<ProtocolObject<dyn MTL4CommandAllocator>>> = Vec::new();
+        for _ in 0..3 {
+            if let Some(a) = device.newCommandAllocator() { allocators.push(a); }
+        }
+        let frames_in_flight = 3;
+        let inflight_staging: Vec<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>> = (0..frames_in_flight).map(|_| Vec::new()).collect();
+        let inflight_tables: Vec<Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>> = (0..frames_in_flight).map(|_| Vec::new()).collect();
+        let inflight_tensors: Vec<Vec<Retained<ProtocolObject<dyn MTLTensor>>>> = (0..frames_in_flight).map(|_| Vec::new()).collect();
+        let inflight_fences: Vec<u64> = vec![0; frames_in_flight];
+
         Self {
             logger,
             timing_method,
@@ -111,6 +132,14 @@ impl Metal4Server {
             residency,
             event,
             fence_value: 0,
+            cb,
+            allocators,
+            frames_in_flight,
+            frame_cursor: 0,
+            inflight_staging,
+            inflight_fences,
+            inflight_tables,
+            inflight_tensors,
             pipelines: HashMap::new(),
             allow_pointer_fallback,
         }
@@ -391,10 +420,31 @@ impl ComputeServer for Metal4Server {
         // For MPP detection below
         let use_mpp = kernel.name().contains("mpp_matmul_2d") || compile.entrypoint_name.as_str() == "mpp_matmul_2d";
 
-        // Create MTL4 command buffer and encoder
-        let Some(cb) = self.device.newCommandBuffer() else { return; };
-        // Begin with an allocator per Metal 4 validation requirements
-        if let Some(alloc) = self.device.newCommandAllocator() {
+        // Create or reuse MTL4 command buffer and begin with next allocator
+        let cb = match &self.cb {
+            Some(cb) => cb.clone(),
+            None => match self.device.newCommandBuffer() { Some(c) => { self.cb = Some(c.clone()); c }, None => return },
+        };
+        if !self.allocators.is_empty() {
+            self.frame_cursor = (self.frame_cursor + 1) % self.allocators.len();
+            // Ensure previous work in this frame slot is finished before reusing and dropping old staging buffers
+            let prev_fence = self.inflight_fences[self.frame_cursor];
+            if prev_fence > 0 {
+                let ev = self.event.clone();
+                // Busy-wait with short timeout until signaled; keeps API simple here
+                loop {
+                    let done = ev.waitUntilSignaledValue_timeoutMS(prev_fence, 10);
+                    if done || ev.signaledValue() >= prev_fence { break; }
+                }
+                // Safe to drop prior staging buffers for this frame slot
+                self.inflight_staging[self.frame_cursor].clear();
+                self.inflight_tables[self.frame_cursor].clear();
+                self.inflight_tensors[self.frame_cursor].clear();
+                self.inflight_fences[self.frame_cursor] = 0;
+            }
+            let alloc = &self.allocators[self.frame_cursor];
+            let _ = cb.beginCommandBufferWithAllocator(alloc);
+        } else if let Some(alloc) = self.device.newCommandAllocator() {
             let _ = cb.beginCommandBufferWithAllocator(&alloc);
         }
         // Ensure residency set is applied to this command buffer
@@ -402,17 +452,27 @@ impl ComputeServer for Metal4Server {
         let Some(encoder) = cb.computeCommandEncoder() else { return; };
         encoder.setComputePipelineState(&pso);
 
-        // Create MTL4 argument table sized to buffer bindings (buffers + metadata + scalars)
+        // Create MTL4 argument table sized to buffer bindings (buffers + metadata + aux + scalars)
         let scalar_bind_count = bindings.scalars.values().map(|_s| 1usize).sum::<usize>();
         let meta_bind_count = if bindings.metadata.data.is_empty() { 0 } else { 1 };
-        let buf_bind_count = bindings.buffers.len() + scalar_bind_count + meta_bind_count;
+        // Bind aux out_len only when the generated kernel expects it (has_metadata && has an output)
+        let want_aux = compile
+            .repr
+            .as_ref()
+            .map(|m| m.has_metadata && m.output_index.is_some())
+            .unwrap_or(false);
+        let aux_bind_count = if want_aux { 1 } else { 0 };
+        let buf_bind_count = bindings.buffers.len() + scalar_bind_count + meta_bind_count + aux_bind_count;
         let at_desc = MTL4ArgumentTableDescriptor::new();
         // Bind buffers + metadata + scalars for all kernels
         let only_buffers = false;
         at_desc.setMaxBufferBindCount(buf_bind_count as NSUInteger);
         if let Ok(arg_table) = self.device.newArgumentTableWithDescriptor_error(&at_desc) {
-            // 1) Bind inputs: for MPP use tensors via resource IDs; otherwise bind buffer GPU addresses
+            // Keep strong references to transient per-dispatch buffers until GPU finishes this frame
+            let mut owned: Vec<Retained<ProtocolObject<dyn MTLBuffer>>> = Vec::new();
+            // 1) Bind inputs: bind MTLTensor for typed tensor parameters via resource IDs
             let mut next_index = 0usize;
+            let cap = buf_bind_count;
             // Precompute metadata section offsets
             let total_bufs = bindings.buffers.len();
             let data = &bindings.metadata.data;
@@ -526,22 +586,19 @@ impl ComputeServer for Metal4Server {
                 };
                 let rid = tensor.gpuResourceID();
                 unsafe { arg_table.setResource_atBufferIndex(rid, next_index as NSUInteger) };
-                // Residency for tensor and underlying buffer
-                unsafe {
-                    let tensor_alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLTensor>, &ProtocolObject<dyn MTLAllocation>>(tensor.as_ref());
-                    self.residency.addAllocation(tensor_alloc);
-                }
+                // Residency: add underlying buffer allocation when available
                 if let Some(underlying) = tensor.buffer() {
                     unsafe {
                         let alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLBuffer>, &ProtocolObject<dyn MTLAllocation>>(underlying.as_ref());
                         self.residency.addAllocation(alloc);
                     }
                 }
+                // Retain tensor view until this frame's fence signals
+                self.inflight_tensors[self.frame_cursor].push(tensor);
                 next_index += 1;
+                if next_index > cap { eprintln!("[cubecl-metal4] ERROR: binding overflows argument table ({} > {})", next_index, cap); return; }
             }
-            // Ensure resources are made resident for this dispatch
-            self.residency.requestResidency();
-            self.residency.commit();
+            // Defer residency request until all resources (tensors + metadata + aux + scalars) are bound below
 
             if !only_buffers {
                 // 2) Pack and bind metadata (u32 words)
@@ -615,7 +672,9 @@ impl ComputeServer for Metal4Server {
                             let alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLBuffer>, &ProtocolObject<dyn MTLAllocation>>(buf.as_ref());
                             self.residency.addAllocation(alloc);
                         }
+                        owned.push(buf);
                         next_index += 1;
+                        if next_index > cap { eprintln!("[cubecl-metal4] ERROR: binding overflows argument table ({} > {})", next_index, cap); return; }
                     } else {
                         return;
                     }
@@ -644,7 +703,9 @@ impl ComputeServer for Metal4Server {
                                 let alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLBuffer>, &ProtocolObject<dyn MTLAllocation>>(buf.as_ref());
                                 self.residency.addAllocation(alloc);
                             }
+                            owned.push(buf);
                             next_index += 1;
+                            if next_index > cap { eprintln!("[cubecl-metal4] ERROR: binding overflows argument table ({} > {})", next_index, cap); return; }
                         }
                     }
                 }
@@ -670,11 +731,19 @@ impl ComputeServer for Metal4Server {
                         }
                     }
                     next_index += 1;
+                    if next_index > cap { eprintln!("[cubecl-metal4] ERROR: binding overflows argument table ({} > {})", next_index, cap); return; }
                 }
             }
 
+            // Ensure resources are made resident for this dispatch now that all bindings are in the table
+            self.residency.requestResidency();
+            self.residency.commit();
             // Attach table after binding is complete (snapshot on dispatch)
             encoder.setArgumentTable(Some(&arg_table));
+            // Attach owned buffers to this frame slot to keep them alive until fence signals
+            self.inflight_staging[self.frame_cursor].extend(owned.into_iter());
+            // Also retain the argument table itself until this frame's fence signals
+            self.inflight_tables[self.frame_cursor].push(arg_table);
         }
 
         // Compute grid and threads
@@ -782,6 +851,8 @@ impl ComputeServer for Metal4Server {
         self.fence_value = self.fence_value.saturating_add(1);
         let ev: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.event);
         self.queue.signalEvent_value(ev, self.fence_value);
+        // Record fence for this frame slot
+        self.inflight_fences[self.frame_cursor] = self.fence_value;
     }
 
     fn flush(&mut self, _stream_id: StreamId) {}
