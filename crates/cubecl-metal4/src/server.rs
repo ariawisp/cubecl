@@ -309,10 +309,8 @@ impl ComputeServer for Metal4Server {
         let mut kid = kernel.id();
         kid.mode(kind);
 
-        let pso = if let Some(p) = self.pipelines.get(&kid) {
-            p.clone()
-        } else {
-            // Compile source to library for function reference (override for MPP matmul)
+        let pso = {
+            // Always compile fresh during development to avoid stale PSOs when source changes
             let opts = MTLCompileOptions::new();
             // Ensure MSL 4.0 language features are available
             opts.setLanguageVersion(objc2_metal::MTLLanguageVersion::Version4_0);
@@ -385,6 +383,7 @@ impl ComputeServer for Metal4Server {
                     .newComputePipelineStateWithFunction_error(&function)
                     .expect("Failed to create compute pipeline state")
             });
+            // Optionally cache latest
             self.pipelines.insert(kid.clone(), pso.clone());
             pso
         };
@@ -484,12 +483,8 @@ impl ComputeServer for Metal4Server {
                             (dims, strides)
                         }
                     } else {
-                        // Fallback to rank-1
-                        let len: NSInteger = if data.len() >= total_bufs * 2 {
-                            data[total_bufs + i] as NSInteger
-                        } else {
-                            ((res.size - res.offset as u64) / elem_size) as NSInteger
-                        };
+                        // Fallback to rank-1 using scalar length
+                        let len: NSInteger = (res.size / elem_size as u64) as NSInteger;
                         let shape_vals = [len];
                         let stride_vals = [1 as NSInteger];
                         let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
@@ -499,12 +494,8 @@ impl ComputeServer for Metal4Server {
                         (dims, strides)
                     }
                 } else {
-                    // Rank-1 default
-                    let len: NSInteger = if data.len() >= total_bufs * 2 {
-                        data[total_bufs + i] as NSInteger
-                    } else {
-                        ((res.size - res.offset as u64) / elem_size) as NSInteger
-                    };
+                    // Rank-1 default using scalar length
+                    let len: NSInteger = (res.size / elem_size as u64) as NSInteger;
                     let shape_vals = [len];
                     let stride_vals = [1 as NSInteger];
                     let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
@@ -612,23 +603,22 @@ impl ComputeServer for Metal4Server {
                         println!("[cubecl-metal4] meta buffer_lens={:?} lengths={:?}", &meta_slice[0..bindings.buffers.len()], &meta_slice[bindings.buffers.len()..(bindings.buffers.len()*2)]);
                     }
                     let meta_bytes: &[u8] = bytemuck::cast_slice(meta_slice);
-                    let meta_handle = match self.create_with_data(meta_bytes, _stream_id) {
-                        Ok(h) => h,
-                        Err(_) => return,
-                    };
-                    let br = self.get_resource(meta_handle.clone().binding(), _stream_id);
-                    let res = br.resource();
-                    let addr = (res.gpu_address as usize + res.offset) as MTLGPUAddress;
-                    unsafe { arg_table.setAddress_atIndex(addr, next_index as NSUInteger) };
-                    // Ensure residency for metadata buffer
-                    let storage_ref = self.mem_manage.storage();
-                    if let Some(buf) = storage_ref.get_buffer(&res.storage_id) {
+                    let options = objc2_metal::MTLResourceOptions::StorageModeShared;
+                    if let Some(buf) = self.device.newBufferWithLength_options(meta_bytes.len() as NSUInteger, options) {
+                        unsafe {
+                            let ptr = buf.contents().as_ptr() as *mut u8;
+                            core::ptr::copy_nonoverlapping(meta_bytes.as_ptr(), ptr, meta_bytes.len());
+                        }
+                        let addr = buf.gpuAddress() as MTLGPUAddress;
+                        unsafe { arg_table.setAddress_atIndex(addr, next_index as NSUInteger) };
                         unsafe {
                             let alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLBuffer>, &ProtocolObject<dyn MTLAllocation>>(buf.as_ref());
                             self.residency.addAllocation(alloc);
                         }
+                        next_index += 1;
+                    } else {
+                        return;
                     }
-                    next_index += 1;
                 }
 
                 // 3) Bind auxiliary out_len scalar for elementwise guard
@@ -641,16 +631,18 @@ impl ComputeServer for Metal4Server {
                         let out_len: u32 = (res.size / esz) as u32;
                         let out_len_arr = [out_len];
                         let aux_bytes: &[u8] = bytemuck::cast_slice(&out_len_arr);
-                        if let Ok(h) = self.create_with_data(aux_bytes, _stream_id) {
-                            let br2 = self.get_resource(h.clone().binding(), _stream_id);
-                            let res2 = br2.resource();
-                            let addr2 = (res2.gpu_address as usize + res2.offset) as MTLGPUAddress;
+                        let options = objc2_metal::MTLResourceOptions::StorageModeShared;
+                        if let Some(buf) = self.device.newBufferWithLength_options(aux_bytes.len() as NSUInteger, options) {
+                            unsafe {
+                                let nn = buf.contents();
+                                let ptr = nn.as_ptr() as *mut u8;
+                                core::ptr::copy_nonoverlapping(aux_bytes.as_ptr(), ptr, aux_bytes.len());
+                            }
+                            let addr2 = buf.gpuAddress() as MTLGPUAddress;
                             unsafe { arg_table.setAddress_atIndex(addr2, next_index as NSUInteger) };
-                            if let Some(buf2) = self.mem_manage.storage().get_buffer(&res2.storage_id) {
-                                unsafe {
-                                    let alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLBuffer>, &ProtocolObject<dyn MTLAllocation>>(buf2.as_ref());
-                                    self.residency.addAllocation(alloc);
-                                }
+                            unsafe {
+                                let alloc: &ProtocolObject<dyn MTLAllocation> = core::mem::transmute::<&ProtocolObject<dyn MTLBuffer>, &ProtocolObject<dyn MTLAllocation>>(buf.as_ref());
+                                self.residency.addAllocation(alloc);
                             }
                             next_index += 1;
                         }
