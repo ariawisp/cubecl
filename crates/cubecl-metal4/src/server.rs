@@ -11,14 +11,14 @@ use cubecl_core::{
     prelude::*,
     server::{Binding, Bindings, CopyDescriptor, ProfileError, ProfilingToken},
 };
-use cubecl_msl4::{Msl4Compiler, Msl4Module};
+use cubecl_msl4::Msl4Compiler;
 use cubecl_runtime::config::GlobalConfig;
 use cubecl_runtime::logging::ServerLogger;
 use cubecl_runtime::memory_management::MemoryDeviceProperties;
 use cubecl_runtime::server::ComputeServer;
 use cubecl_runtime::storage::{BindingResource, ComputeStorage};
 
-use crate::storage::{Metal4Resource, Metal4Storage};
+use crate::storage::Metal4Storage;
 use hashbrown::HashMap;
 use objc2::rc::Retained;
 use objc2::ClassType;
@@ -33,10 +33,10 @@ use objc2_metal::{
     MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice as _, MTLGPUAddress, MTLLibrary,
     MTLSize,
 };
-use objc2_metal::{MTLCommandQueue, MTLCommandBuffer, MTLComputeCommandEncoder};
+// Legacy command queue API not used in MTL4 path
 use objc2_metal::{MTLEvent, MTLSharedEvent};
 use objc2_metal::{MTLResidencySet, MTLResidencySetDescriptor, MTLAllocation};
-use objc2_metal::MTL4CommandAllocator;
+// Allocator used implicitly when beginning MTL4 command buffer
 // MTLTensor API (Metal 4)
 use objc2_metal::{MTLTensor, MTLTensorDescriptor, MTLTensorExtents, MTLTensorDataType, MTLTensorUsage};
 use core::ptr::NonNull;

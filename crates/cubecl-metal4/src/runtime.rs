@@ -1,6 +1,5 @@
 extern crate alloc;
 use alloc::sync::Arc;
-use cubecl_common::future;
 use cubecl_core::{CubeCount, CubeDim, Runtime, ir::TargetProperties};
 use cubecl_runtime::channel;
 use cubecl_runtime::client::ComputeClient;

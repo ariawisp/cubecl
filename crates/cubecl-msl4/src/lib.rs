@@ -1,6 +1,6 @@
 use cubecl_common::ExecutionMode;
 use cubecl_core::{codegen::Compiler, compute::KernelDefinition};
-use cubecl_ir::{Type, StorageType, ElemType, FloatKind, IntKind, UIntKind, Operation, Arithmetic};
+use cubecl_ir::{Type, StorageType, ElemType, FloatKind, IntKind, UIntKind};
 
 #[derive(Clone, Debug, Default)]
 pub struct Msl4CompilationOptions {
