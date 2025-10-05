@@ -50,6 +50,7 @@ struct Msl4SpecKey {
     entry: alloc::string::String,
     line: u32,
     types: alloc::vec::Vec<cubecl_ir::ElemType>,
+    fast_math: bool,
 }
 /// Metal 4 compute server (scaffold).
 #[derive(Debug)]
@@ -341,13 +342,15 @@ impl ComputeServer for Metal4Server {
         let mut kid = kernel.id();
         kid.mode(kind);
         // Specialize kernel id by entrypoint, vectorization (line size), and element types
+        let fast_math = std::env::var("CUBECL_MTL4_FAST_MATH").ok().as_deref() == Some("1");
         let spec = match compile.repr.as_ref() {
             Some(m) => Msl4SpecKey {
                 entry: compile.entrypoint_name.clone(),
                 line: m.output_line_size,
                 types: m.buffers.iter().map(|p| p.elem).collect(),
+                fast_math,
             },
-            None => Msl4SpecKey { entry: compile.entrypoint_name.clone(), line: 1, types: alloc::vec::Vec::new() },
+            None => Msl4SpecKey { entry: compile.entrypoint_name.clone(), line: 1, types: alloc::vec::Vec::new(), fast_math },
         };
         let kid = kid.info(spec);
 

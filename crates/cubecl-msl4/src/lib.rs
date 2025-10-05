@@ -120,6 +120,7 @@ impl Compiler for Msl4Compiler {
             Floor,
             Ceil,
             Round,
+            ReduceSum1D,
         }
         let mut detected_op: Option<OpKind> = None;
         for inst in &kernel.body.instructions {
@@ -154,6 +155,7 @@ impl Compiler for Msl4Compiler {
             else if lname.contains("div_") || lname.starts_with("div_") { detected_op = Some(OpKind::Div); }
             else if lname.contains("neg_") || lname.starts_with("neg_") { detected_op = Some(OpKind::Neg); }
             else if lname.contains("abs_") || lname.starts_with("abs_") { detected_op = Some(OpKind::Abs); }
+            else if lname.contains("reduce_sum_1d") { detected_op = Some(OpKind::ReduceSum1D); }
             else if lname.contains("exp_") || lname.starts_with("exp_") { detected_op = Some(OpKind::Exp); }
             else if lname.contains("log1p_") || lname.starts_with("log1p_") { detected_op = Some(OpKind::Log1p); }
             else if lname.contains("log_") || lname.starts_with("log_") { detected_op = Some(OpKind::Log); }
@@ -235,40 +237,75 @@ impl Compiler for Msl4Compiler {
                     code.push_str(&format!("        const int EXT_B = EXT_IDX_{};\n", b));
                     code.push_str("        uint ib = idx;\n");
                     code.push_str("        if (use_rank2 && EXT_B >= 0) { uint row = idx / out_dims.y; uint col = idx % out_dims.y; uint2 b_dims = __cube_get_dims(__meta, META_N, EXT_N, (uint)EXT_B); uint2 b_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_B); uint rB = (b_dims.x == 1u) ? 0u : row; uint cB = (b_dims.y == 1u) ? 0u : col; ib = rB * b_str.x + cB * b_str.y; } else { if (__lenB == 1u) { ib = 0u; } else if (EXT_B >= 0) { uint2 b_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_B); ib = idx * b_str.x; } else { ib = idx; } }\n");
+                    // Compute output index with strides
+                    code.push_str("        uint io = idx;\n");
+                    code.push_str("        if (use_rank2 && EXT_OUT >= 0) { uint row = idx / out_dims.y; uint col = idx % out_dims.y; uint2 o_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_OUT); io = row * o_str.x + col * o_str.y; } else { if (EXT_OUT >= 0) { uint2 o_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_OUT); io = idx * o_str.x; } }\n");
                 } else {
-                    code.push_str("        const uint ia = idx; const uint ib = idx;\n");
+                    code.push_str("        const uint ia = idx; const uint ib = idx; const uint io = idx;\n");
                 }
                 match guard_if {
-                    Some(pre) => code.push_str(&format!("        {}{{ b{}[idx] = b{}[ia] {} b{}[ib]; }}\n", pre, dst, a, op, b)),
-                    None => code.push_str(&format!("        b{}[idx] = b{}[ia] {} b{}[ib];\n", dst, a, op, b)),
+                    Some(pre) => code.push_str(&format!("        {}{{ b{}[io] = b{}[ia] {} b{}[ib]; }}\n", pre, dst, a, op, b)),
+                    None => code.push_str(&format!("        b{}[io] = b{}[ia] {} b{}[ib];\n", dst, a, op, b)),
                 }
                 code.push_str("    }\n");
                 code
             };
             let gen_un = |func: &str, a: usize| -> String {
                 if func.is_empty() {
-                    // copy
-                    match guard_if {
-                        Some(pre) => format!(
-                            "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        {pre}{{ b{dst}[idx] = b{a}[idx]; }}\n    }}\n",
-                            header = header, pre = pre, dst = dst, a = a
-                        ),
-                        None => format!(
-                            "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        b{dst}[idx] = b{a}[idx];\n    }}\n",
-                            header = header, dst = dst, a = a
-                        ),
+                    // copy with stride/broadcast awareness when metadata exists
+                    let mut code = String::new();
+                    code.push_str(&header);
+                    if has_metadata {
+                        code.push_str(&format!("    const uint META_N = {}u;\n    const uint EXT_N = {}u;\n", num_meta, { let mut c=0u32; for b in &kernel.buffers { if b.has_extended_meta { c+=1; } } c }));
+                        code.push_str(&ext_indices_consts);
+                        code.push_str(&format!(
+                            "    const uint __lenA = __meta[{}u + {}u];\n",
+                            num_meta, a as u32
+                        ));
                     }
+                    code.push_str("    for (uint lane = 0; lane < LINE; ++lane) {\n        const uint idx = (uint)(base + lane);\n");
+                    if has_metadata {
+                        code.push_str(&format!("        const int EXT_OUT = EXT_IDX_{};\n", dst));
+                        code.push_str("        uint2 out_dims = (EXT_OUT >= 0) ? __cube_get_dims(__meta, META_N, EXT_N, (uint)EXT_OUT) : uint2(0u,0u);\n");
+                        code.push_str("        bool use_rank2 = (out_dims.x > 0u) && (out_dims.y > 0u) && (out_dims.x * out_dims.y == __len);\n");
+                        code.push_str(&format!("        const int EXT_A = EXT_IDX_{};\n", a));
+                        code.push_str("        uint ia = idx;\n");
+                        code.push_str("        if (use_rank2 && EXT_A >= 0) { uint row = idx / out_dims.y; uint col = idx % out_dims.y; uint2 a_dims = __cube_get_dims(__meta, META_N, EXT_N, (uint)EXT_A); uint2 a_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_A); uint rA = (a_dims.x == 1u) ? 0u : row; uint cA = (a_dims.y == 1u) ? 0u : col; ia = rA * a_str.x + cA * a_str.y; } else { if (__lenA == 1u) { ia = 0u; } else if (EXT_A >= 0) { uint2 a_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_A); ia = idx * a_str.x; } else { ia = idx; } }\n");
+                        code.push_str("        uint io = idx;\n");
+                        code.push_str("        if (use_rank2 && EXT_OUT >= 0) { uint row = idx / out_dims.y; uint col = idx % out_dims.y; uint2 o_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_OUT); io = row * o_str.x + col * o_str.y; } else { if (EXT_OUT >= 0) { uint2 o_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_OUT); io = idx * o_str.x; } }\n");
+                        match guard_if { Some(pre) => code.push_str(&format!("        {}{{ b{dst}[io] = b{a}[ia]; }}\n", pre, dst=dst, a=a)), None => code.push_str(&format!("        b{dst}[io] = b{a}[ia];\n", dst=dst, a=a)), }
+                    } else {
+                        match guard_if { Some(pre) => code.push_str(&format!("        {}{{ b{dst}[idx] = b{a}[idx]; }}\n", pre, dst=dst, a=a)), None => code.push_str(&format!("        b{dst}[idx] = b{a}[idx];\n", dst=dst, a=a)), }
+                    }
+                    code.push_str("    }\n");
+                    return code;
                 } else {
-                    match guard_if {
-                        Some(pre) => format!(
-                            "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        {pre}{{ b{dst}[idx] = {func}(b{a}[idx]); }}\n    }}\n",
-                            header = header, pre = pre, dst = dst, a = a, func = func
-                        ),
-                        None => format!(
-                            "{header}    for (uint lane = 0; lane < LINE; ++lane) {{\n        const size_t idx = base + lane;\n        b{dst}[idx] = {func}(b{a}[idx]);\n    }}\n",
-                            header = header, dst = dst, a = a, func = func
-                        ),
+                    let mut code = String::new();
+                    code.push_str(&header);
+                    if has_metadata {
+                        code.push_str(&format!("    const uint META_N = {}u;\n    const uint EXT_N = {}u;\n", num_meta, { let mut c=0u32; for b in &kernel.buffers { if b.has_extended_meta { c+=1; } } c }));
+                        code.push_str(&ext_indices_consts);
+                        code.push_str(&format!(
+                            "    const uint __lenA = __meta[{}u + {}u];\n",
+                            num_meta, a as u32
+                        ));
                     }
+                    code.push_str("    for (uint lane = 0; lane < LINE; ++lane) {\n        const uint idx = (uint)(base + lane);\n");
+                    if has_metadata {
+                        code.push_str(&format!("        const int EXT_OUT = EXT_IDX_{};\n", dst));
+                        code.push_str("        uint2 out_dims = (EXT_OUT >= 0) ? __cube_get_dims(__meta, META_N, EXT_N, (uint)EXT_OUT) : uint2(0u,0u);\n");
+                        code.push_str("        bool use_rank2 = (out_dims.x > 0u) && (out_dims.y > 0u) && (out_dims.x * out_dims.y == __len);\n");
+                        code.push_str(&format!("        const int EXT_A = EXT_IDX_{};\n", a));
+                        code.push_str("        uint ia = idx;\n");
+                        code.push_str("        if (use_rank2 && EXT_A >= 0) { uint row = idx / out_dims.y; uint col = idx % out_dims.y; uint2 a_dims = __cube_get_dims(__meta, META_N, EXT_N, (uint)EXT_A); uint2 a_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_A); uint rA = (a_dims.x == 1u) ? 0u : row; uint cA = (a_dims.y == 1u) ? 0u : col; ia = rA * a_str.x + cA * a_str.y; } else { if (__lenA == 1u) { ia = 0u; } else if (EXT_A >= 0) { uint2 a_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_A); ia = idx * a_str.x; } else { ia = idx; } }\n");
+                        code.push_str("        uint io = idx;\n");
+                        code.push_str("        if (use_rank2 && EXT_OUT >= 0) { uint row = idx / out_dims.y; uint col = idx % out_dims.y; uint2 o_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_OUT); io = row * o_str.x + col * o_str.y; } else { if (EXT_OUT >= 0) { uint2 o_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_OUT); io = idx * o_str.x; } }\n");
+                        match guard_if { Some(pre) => code.push_str(&format!("        {}{{ b{dst}[io] = {func}(b{a}[ia]); }}\n", pre, dst=dst, func=func, a=a)), None => code.push_str(&format!("        b{dst}[io] = {func}(b{a}[ia]);\n", dst=dst, func=func, a=a)), }
+                    } else {
+                        match guard_if { Some(pre) => code.push_str(&format!("        {}{{ b{dst}[idx] = {func}(b{a}[idx]); }}\n", pre, dst=dst, func=func, a=a)), None => code.push_str(&format!("        b{dst}[idx] = {func}(b{a}[idx]);\n", dst=dst, func=func, a=a)), }
+                    }
+                    code.push_str("    }\n");
+                    code
                 }
             };
 
@@ -277,6 +314,32 @@ impl Compiler for Msl4Compiler {
                 (2, Some(OpKind::Sub)) => gen_bin("-", inputs_idx[0], inputs_idx[1]),
                 (2, Some(OpKind::Mul)) => gen_bin("*", inputs_idx[0], inputs_idx[1]),
                 (2, Some(OpKind::Div)) => gen_bin("/", inputs_idx[0], inputs_idx[1]),
+                (1, Some(OpKind::ReduceSum1D)) => {
+                    // Specialized 1D sum reduction over input 'a' into output[0]
+                    let a = inputs_idx[0];
+                    let mut code = String::new();
+                    code.push_str(&header);
+                    if has_metadata {
+                        code.push_str(&format!("    const uint META_N = {}u;\n    const uint EXT_N = {}u;\n", num_meta, { let mut c=0u32; for b in &kernel.buffers { if b.has_extended_meta { c+=1; } } c }));
+                        code.push_str(&ext_indices_consts);
+                        code.push_str(&format!(
+                            "    const uint __lenA = __meta[{}u + {}u];\n",
+                            num_meta, a as u32
+                        ));
+                        code.push_str(&format!("    const int EXT_A = EXT_IDX_{};\n", a));
+                        code.push_str(&format!("    const int EXT_OUT = EXT_IDX_{};\n", dst));
+                        code.push_str("    float sum = 0.0;\n    for (uint k = 0u; k < __lenA; ++k) { uint ia = k; if (EXT_A >= 0) { uint2 a_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_A); ia = k * a_str.x; } sum += b");
+                        code.push_str(&format!("{}[ia];\n", a));
+                        code.push_str("    }\n    uint io = 0u; if (EXT_OUT >= 0) { uint2 o_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_OUT); io = 0u; }\n");
+                        code.push_str(&format!("    b{}[io] = sum;\n", dst));
+                    } else {
+                        code.push_str("    float sum = 0.0;\n");
+                        code.push_str("    // Without metadata, unable to get length; use __len as total elements if available\n");
+                        code.push_str("    for (uint k = 0u; k < __len; ++k) { sum += b");
+                        code.push_str(&format!("{}[k]; }}\n    b{}[0] = sum;\n", a, dst));
+                    }
+                    code
+                }
                 (1, Some(OpKind::Neg)) => {
                     match guard_if {
                         Some(pre) => format!(

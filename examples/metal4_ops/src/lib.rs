@@ -395,10 +395,13 @@ pub fn run<R: Runtime>(device: &R::Device) {
 
     // (Cast kernels deferred) – keeping runtime focused tests runnable.
 
-    // Rank-1 strided copy (Tensor path) – TODO: enable after stride lowering lands
-    // for &vec in &[1u8, 4] {
-    //     run_rank1_strided::<R, f32>(&client, 16, 2, vec);
-    // }
+    // Rank-1 strided copy (Tensor path)
+    for &vec in &[1u8, 4] {
+        run_rank1_strided::<R, f32>(&client, 16, 2, vec);
+    }
+
+    // Reduction 1D demo: sum to scalar
+    run_reduce_sum_1d::<R, f32>(&client, 37);
 }
 
 #[cube(launch_unchecked)]
@@ -540,6 +543,33 @@ fn run_rank1_strided<R: Runtime, F: Float + CubeElement + ToF32>(client: &Comput
     for i in 0..n { exp.push(src_full[i * stride]); }
     let approx = |u:&[F], v:&[F]| u.len()==v.len() && u.iter().zip(v.iter()).all(|(x,y)| (ToF32::to_f32(*x) - ToF32::to_f32(*y)).abs() < 1e-6);
     println!("[rank1 stride vec={}] copy 1D stride={} ok? {}", vec, stride, approx(&out, &exp));
+}
+
+// Minimal 1D reduction demo (special-cased by MSL4 codegen)
+#[cube(launch_unchecked)]
+fn reduce_sum_1d<F: Float>(a: &Tensor<Line<F>>, out: &mut Array<Line<F>>) {
+    if ABSOLUTE_POS < out.len() { out[ABSOLUTE_POS] = F::new(0.0); }
+}
+
+fn run_reduce_sum_1d<R: Runtime, F: Float + CubeElement + ToF32>(client: &ComputeClient<R::Server, R::Channel>, n: usize) {
+    let a: Vec<F> = (0..n).map(|i| F::new((i as f32) * 0.25 + 0.5)).collect();
+    let a_h = client.create(F::as_bytes(&a));
+    let out_h = client.empty(1 * core::mem::size_of::<F>());
+    let shape = vec![n];
+    let strides = vec![1usize];
+    unsafe {
+        let dim = CubeDim::new(1, 1, 1);
+        reduce_sum_1d::launch_unchecked::<F, R>(client, CubeCount::Static(1,1,1), dim,
+            TensorArg::from_raw_parts::<F>(&a_h, &strides, &shape, 1),
+            ArrayArg::from_raw_parts::<F>(&out_h, 1, 1));
+    }
+    future::block_on(client.sync());
+    let out_b = client.read_one(out_h);
+    let out = F::from_bytes(&out_b);
+    let got = out[0].to_f32();
+    let exp = a.iter().map(|x| x.to_f32()).sum::<f32>();
+    let ok = (got - exp).abs() < 1e-4 * f32::max(1.0, exp.abs());
+    println!("[reduce sum 1d] n={} ok? {}", n, ok);
 }
 
 #[cfg(feature = "metal4")]
