@@ -9,7 +9,56 @@ use cubecl_runtime::{ComputeRuntime, logging::ServerLogger};
 
 use crate::device::Metal4Device;
 use crate::server::Metal4Server;
-use cubecl_msl4::Msl4Compiler;
+use crate::compiler::Msl4Compiler;
+
+// Probe device/pipeline limits via Metal 4 APIs
+use objc2::rc::Retained;
+use objc2::ClassType;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::NSString;
+use objc2_metal::MTLDevice as _;
+use objc2_metal::{
+    MTL4Compiler, MTL4CompilerDescriptor, MTL4ComputePipelineDescriptor, MTL4FunctionDescriptor,
+    MTL4LibraryFunctionDescriptor, MTLCompileOptions, MTLComputePipelineState, MTLCreateSystemDefaultDevice,
+    MTLLanguageVersion, MTLLibrary,
+};
+
+fn probe_pipeline_limits() -> Option<(usize, usize)> {
+    // Returns (thread_execution_width, max_total_threads_per_tg)
+    let device = MTLCreateSystemDefaultDevice()?;
+    // Minimal MSL 4.0 kernel
+    let src = r#"#include <metal_stdlib>
+using namespace metal;
+kernel void __probe(uint3 tid [[thread_position_in_grid]]) { (void)tid; }"#;
+    let src_ns = NSString::from_str(src);
+
+    let opts = MTLCompileOptions::new();
+    opts.setLanguageVersion(MTLLanguageVersion::Version4_0);
+    let library: Retained<ProtocolObject<dyn MTLLibrary>> = device
+        .newLibraryWithSource_options_error(&src_ns, Some(&opts))
+        .ok()?;
+
+    let comp_desc = MTL4CompilerDescriptor::new();
+    let compiler: Retained<ProtocolObject<dyn MTL4Compiler>> = device
+        .newCompilerWithDescriptor_error(&comp_desc)
+        .ok()?;
+
+    let lf = MTL4LibraryFunctionDescriptor::new();
+    let fname = NSString::from_str("__probe");
+    lf.setName(Some(&fname));
+    lf.setLibrary(Some(&library));
+
+    let cpdesc = MTL4ComputePipelineDescriptor::new();
+    let base: &MTL4FunctionDescriptor = lf.as_super();
+    cpdesc.setComputeFunctionDescriptor(Some(base));
+    let pso: Retained<ProtocolObject<dyn MTLComputePipelineState>> = compiler
+        .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&cpdesc, None)
+        .ok()?;
+
+    let tew = pso.threadExecutionWidth() as usize;
+    let max_tg = pso.maxTotalThreadsPerThreadgroup() as usize;
+    Some((tew.max(1), max_tg.max(tew)))
+}
 
 #[derive(Debug)]
 pub struct Metal4Runtime;
@@ -27,18 +76,20 @@ impl Runtime for Metal4Runtime {
 
     fn client(device: &Self::Device) -> ComputeClient<Self::Server, Self::Channel> {
         RUNTIME.client(device, || {
-            // Build minimal DeviceProperties; tune later for actual Metal 4 limits
+            // Build DeviceProperties from device/pipeline probing when available
             let mem_props = MemoryDeviceProperties {
                 max_page_size: 1 << 30, // placeholder
                 alignment: 256,
             };
+            let (_tew, max_tg) = probe_pipeline_limits().unwrap_or((32, 1024));
             let hardware_props = HardwareProperties {
                 plane_size_min: 32,
                 plane_size_max: 32,
                 max_bindings: 64,
-                max_shared_memory_size: 64 * 1024,
+                max_shared_memory_size: 64 * 1024, // conservative default
                 max_cube_count: CubeCount::new_3d(65535, 65535, 65535),
-                max_units_per_cube: 1024,
+                max_units_per_cube: max_tg as u32,
+                // Favor generous XY with conservative Z; TEW informs optimal widths
                 max_cube_dim: CubeDim::new_3d(1024, 1024, 64),
                 num_streaming_multiprocessors: None,
                 num_tensor_cores: None,

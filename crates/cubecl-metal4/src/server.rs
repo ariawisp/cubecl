@@ -11,7 +11,7 @@ use cubecl_core::{
     prelude::*,
     server::{Binding, Bindings, CopyDescriptor, ProfileError, ProfilingToken},
 };
-use cubecl_msl4::Msl4Compiler;
+use crate::compiler::Msl4Compiler;
 use cubecl_runtime::config::GlobalConfig;
 use cubecl_runtime::logging::ServerLogger;
 use cubecl_runtime::memory_management::MemoryDeviceProperties;
@@ -70,6 +70,9 @@ pub struct Metal4Server {
     allocators: Vec<Retained<ProtocolObject<dyn MTL4CommandAllocator>>>,
     frames_in_flight: usize,
     frame_cursor: usize,
+    // Optional batching: defer commit and submit multiple command buffers as a group
+    pending_cbs: Vec<Retained<ProtocolObject<dyn MTL4CommandBuffer>>>,
+    defer_commit: bool,
     inflight_staging: Vec<Vec<Retained<ProtocolObject<dyn MTLBuffer>>>>,
     inflight_fences: Vec<u64>,
     inflight_tables: Vec<Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>>,
@@ -125,6 +128,8 @@ impl Metal4Server {
         let inflight_tables: Vec<Vec<Retained<ProtocolObject<dyn MTL4ArgumentTable>>>> = (0..frames_in_flight).map(|_| Vec::new()).collect();
         let inflight_tensors: Vec<Vec<Retained<ProtocolObject<dyn MTLTensor>>>> = (0..frames_in_flight).map(|_| Vec::new()).collect();
         let inflight_fences: Vec<u64> = vec![0; frames_in_flight];
+        // Default to grouped commits (optimal CPU overhead). No debug overrides.
+        let defer_commit = true;
 
         Self {
             logger,
@@ -141,6 +146,8 @@ impl Metal4Server {
             allocators,
             frames_in_flight,
             frame_cursor: 0,
+            pending_cbs: Vec::new(),
+            defer_commit,
             inflight_staging,
             inflight_fences,
             inflight_tables,
@@ -297,6 +304,9 @@ impl ComputeServer for Metal4Server {
     }
 
     fn sync(&mut self, _stream_id: StreamId) -> DynFut<()> {
+        if self.defer_commit && !self.pending_cbs.is_empty() {
+            self.flush(_stream_id);
+        }
         // Block until the last submitted work (tracked by a shared event) completes.
         let target_value = self.fence_value;
         let event = self.event.clone();
@@ -378,10 +388,68 @@ impl ComputeServer for Metal4Server {
                     } else { Some(false) }
                 })
                 .unwrap_or(false);
+            // Explicit switch for MPP conv2d
+            let want_mpp_conv = kernel.name().contains("mpp_convolution2d")
+                || compile.entrypoint_name.as_str() == "mpp_convolution2d";
             let use_mpp = kernel.name().contains("mpp_matmul_2d")
                 || compile.entrypoint_name.as_str() == "mpp_matmul_2d"
-                || type_mpp;
-            let src_text = if use_mpp { crate::kernels::mpp_matmul_2d_source() } else { compile.source.clone() };
+                || type_mpp
+                || want_mpp_conv;
+
+            // Build source
+            let src_text = if want_mpp_conv {
+                // Extract dims from metadata for A(0)=NHWC, W(1)=HWIO, D(2)=NHWO; use stride=1, dilation=1, groups=1
+                let mut n = 1; let mut h = 1; let mut w = 1; let mut c = 1;
+                let mut kh = 1; let mut kw = 1; let mut o = 1;
+                let mut hout = 1; let mut wout = 1;
+                if let Some(module) = compile.repr.as_ref() {
+                    let total = module.buffers.len();
+                    let num_ext = module.buffers.iter().filter(|p| p.has_extended_meta).count();
+                    let ranks_start = 2 * total;
+                    let shape_offs_start = ranks_start + num_ext;
+                    let data = &bindings.metadata.data;
+                    let mut ext_idx = 0usize;
+                    // Activation dims
+                    if module.buffers.get(0).map(|p| p.has_extended_meta).unwrap_or(false) {
+                        let shape_base = data.get(shape_offs_start + ext_idx).copied().unwrap_or(0) as usize;
+                        if shape_base + 3 < data.len() {
+                            // NHWC layout expected
+                            n = data[shape_base + 0] as i32;
+                            h = data[shape_base + 1] as i32;
+                            w = data[shape_base + 2] as i32;
+                            c = data[shape_base + 3] as i32;
+                        }
+                        ext_idx += 1;
+                    }
+                    // Weights dims
+                    if module.buffers.get(1).map(|p| p.has_extended_meta).unwrap_or(false) {
+                        let shape_base = data.get(shape_offs_start + ext_idx).copied().unwrap_or(0) as usize;
+                        if shape_base + 3 < data.len() {
+                            kh = data[shape_base + 0] as i32;
+                            kw = data[shape_base + 1] as i32;
+                            let _ci = data[shape_base + 2] as i32; // input channels
+                            o = data[shape_base + 3] as i32; // output channels
+                        }
+                        ext_idx += 1;
+                    }
+                    // Destination dims
+                    if module.buffers.get(2).map(|p| p.has_extended_meta).unwrap_or(false) {
+                        let shape_base = data.get(shape_offs_start + ext_idx).copied().unwrap_or(0) as usize;
+                        if shape_base + 3 < data.len() {
+                            // NHWO layout expected by spec
+                            let _n2 = data[shape_base + 0] as i32;
+                            hout = data[shape_base + 1] as i32;
+                            wout = data[shape_base + 2] as i32;
+                            let _o2 = data[shape_base + 3] as i32;
+                        }
+                    }
+                }
+                crate::kernels::mpp_convolution2d_source(n, h, w, c, kh, kw, o, hout, wout, 1, 1, 1, 1, 1)
+            } else if use_mpp {
+                crate::kernels::mpp_matmul_2d_source()
+            } else {
+                compile.source.clone()
+            };
             #[cfg(debug_assertions)]
             {
                 // Lightweight debug: print the generated MSL once per unique kernel
@@ -893,23 +961,43 @@ impl ComputeServer for Metal4Server {
         encoder.endEncoding();
         // Flush residency changes
         self.residency.commit();
-        // Finalize CB and commit via MTL4CommandQueue
+        // Finalize CB and either defer or commit
         cb.endCommandBuffer();
-        let mut one: [NonNull<ProtocolObject<dyn MTL4CommandBuffer>>; 1] = [
-            NonNull::new(Retained::as_ptr(&cb) as *mut _).expect("nonnull"),
-        ];
-        let arr = NonNull::new(one.as_mut_ptr()).expect("nonnull array ptr");
-        unsafe { self.queue.commit_count(arr, 1) };
+        if self.defer_commit {
+            self.pending_cbs.push(cb);
+        } else {
+            let mut one: [NonNull<ProtocolObject<dyn MTL4CommandBuffer>>; 1] = [
+                NonNull::new(Retained::as_ptr(&cb) as *mut _).expect("nonnull"),
+            ];
+            let arr = NonNull::new(one.as_mut_ptr()).expect("nonnull array ptr");
+            unsafe { self.queue.commit_count(arr, 1) };
 
-        // Signal a shared event so the CPU can wait for completion in sync()
-        self.fence_value = self.fence_value.saturating_add(1);
-        let ev: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.event);
-        self.queue.signalEvent_value(ev, self.fence_value);
-        // Record fence for this frame slot
-        self.inflight_fences[self.frame_cursor] = self.fence_value;
+            // Signal a shared event so the CPU can wait for completion in sync()
+            self.fence_value = self.fence_value.saturating_add(1);
+            let ev: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.event);
+            self.queue.signalEvent_value(ev, self.fence_value);
+            // Record fence for this frame slot
+            self.inflight_fences[self.frame_cursor] = self.fence_value;
+        }
     }
 
-    fn flush(&mut self, _stream_id: StreamId) {}
+    fn flush(&mut self, _stream_id: StreamId) {
+        if self.pending_cbs.is_empty() { return; }
+        let mut ptrs: Vec<NonNull<ProtocolObject<dyn MTL4CommandBuffer>>> = Vec::with_capacity(self.pending_cbs.len());
+        for cb in &self.pending_cbs {
+            if let Some(nn) = NonNull::new(Retained::as_ptr(cb) as *mut _) { ptrs.push(nn); }
+        }
+        if !ptrs.is_empty() {
+            let mut raw = ptrs;
+            let arr = NonNull::new(raw.as_mut_ptr()).expect("nonnull array ptr");
+            unsafe { self.queue.commit_count(arr, raw.len() as _) };
+            self.fence_value = self.fence_value.saturating_add(1);
+            let ev: &ProtocolObject<dyn MTLEvent> = ProtocolObject::from_ref(&*self.event);
+            self.queue.signalEvent_value(ev, self.fence_value);
+            self.inflight_fences[self.frame_cursor] = self.fence_value;
+        }
+        self.pending_cbs.clear();
+    }
 
     fn memory_usage(&mut self, _stream_id: StreamId) -> cubecl_runtime::memory_management::MemoryUsage {
         // Placeholder; will report proper allocator stats.

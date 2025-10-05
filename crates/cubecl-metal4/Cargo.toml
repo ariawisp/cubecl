@@ -18,7 +18,6 @@ std = []
 cubecl-core = { path = "../cubecl-core", version = "0.7.0" }
 cubecl-common = { path = "../cubecl-common", version = "0.7.0" }
 cubecl-runtime = { path = "../cubecl-runtime", version = "0.7.0" }
-cubecl-msl4 = { path = "../cubecl-msl4", version = "0.7.0" }
 cubecl-ir = { path = "../cubecl-ir", version = "0.7.0" }
 
 # objc2 Metal 4 stack (metal-safe branch)
