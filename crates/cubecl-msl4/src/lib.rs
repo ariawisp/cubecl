@@ -154,6 +154,15 @@ impl Compiler for Msl4Compiler {
             else if lname.contains("div_") || lname.starts_with("div_") { detected_op = Some(OpKind::Div); }
             else if lname.contains("neg_") || lname.starts_with("neg_") { detected_op = Some(OpKind::Neg); }
             else if lname.contains("abs_") || lname.starts_with("abs_") { detected_op = Some(OpKind::Abs); }
+            else if lname.contains("exp_") || lname.starts_with("exp_") { detected_op = Some(OpKind::Exp); }
+            else if lname.contains("log1p_") || lname.starts_with("log1p_") { detected_op = Some(OpKind::Log1p); }
+            else if lname.contains("log_") || lname.starts_with("log_") { detected_op = Some(OpKind::Log); }
+            else if lname.contains("recip_") || lname.starts_with("recip_") { detected_op = Some(OpKind::Recip); }
+            else if lname.contains("tanh_") || lname.starts_with("tanh_") { detected_op = Some(OpKind::Tanh); }
+            else if lname.contains("sqrt_") || lname.starts_with("sqrt_") { detected_op = Some(OpKind::Sqrt); }
+            else if lname.contains("floor_") || lname.starts_with("floor_") { detected_op = Some(OpKind::Floor); }
+            else if lname.contains("ceil_") || lname.starts_with("ceil_") { detected_op = Some(OpKind::Ceil); }
+            else if lname.contains("round_") || lname.starts_with("round_") { detected_op = Some(OpKind::Round); }
         }
 
         // Emit basic elementwise on buffers (use operator[] for tensors)
@@ -221,9 +230,11 @@ impl Compiler for Msl4Compiler {
                     code.push_str("        uint2 out_dims = (EXT_OUT >= 0) ? __cube_get_dims(__meta, META_N, EXT_N, (uint)EXT_OUT) : uint2(0u,0u);\n");
                     code.push_str("        bool use_rank2 = (out_dims.x > 0u) && (out_dims.y > 0u) && (out_dims.x * out_dims.y == __len);\n");
                     code.push_str(&format!("        const int EXT_A = EXT_IDX_{};\n", a));
-                    code.push_str("        uint ia = idx;\n        if (use_rank2 && EXT_A >= 0) { uint row = idx / out_dims.y; uint col = idx % out_dims.y; uint2 a_dims = __cube_get_dims(__meta, META_N, EXT_N, (uint)EXT_A); uint2 a_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_A); uint rA = (a_dims.x == 1u) ? 0u : row; uint cA = (a_dims.y == 1u) ? 0u : col; ia = rA * a_str.x + cA * a_str.y; } else { ia = (__lenA == 1u) ? 0u : idx; }\n");
+                    code.push_str("        uint ia = idx;\n");
+                    code.push_str("        if (use_rank2 && EXT_A >= 0) { uint row = idx / out_dims.y; uint col = idx % out_dims.y; uint2 a_dims = __cube_get_dims(__meta, META_N, EXT_N, (uint)EXT_A); uint2 a_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_A); uint rA = (a_dims.x == 1u) ? 0u : row; uint cA = (a_dims.y == 1u) ? 0u : col; ia = rA * a_str.x + cA * a_str.y; } else { if (__lenA == 1u) { ia = 0u; } else if (EXT_A >= 0) { uint2 a_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_A); ia = idx * a_str.x; } else { ia = idx; } }\n");
                     code.push_str(&format!("        const int EXT_B = EXT_IDX_{};\n", b));
-                    code.push_str("        uint ib = idx;\n        if (use_rank2 && EXT_B >= 0) { uint row = idx / out_dims.y; uint col = idx % out_dims.y; uint2 b_dims = __cube_get_dims(__meta, META_N, EXT_N, (uint)EXT_B); uint2 b_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_B); uint rB = (b_dims.x == 1u) ? 0u : row; uint cB = (b_dims.y == 1u) ? 0u : col; ib = rB * b_str.x + cB * b_str.y; } else { ib = (__lenB == 1u) ? 0u : idx; }\n");
+                    code.push_str("        uint ib = idx;\n");
+                    code.push_str("        if (use_rank2 && EXT_B >= 0) { uint row = idx / out_dims.y; uint col = idx % out_dims.y; uint2 b_dims = __cube_get_dims(__meta, META_N, EXT_N, (uint)EXT_B); uint2 b_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_B); uint rB = (b_dims.x == 1u) ? 0u : row; uint cB = (b_dims.y == 1u) ? 0u : col; ib = rB * b_str.x + cB * b_str.y; } else { if (__lenB == 1u) { ib = 0u; } else if (EXT_B >= 0) { uint2 b_str = __cube_get_strides(__meta, META_N, EXT_N, (uint)EXT_B); ib = idx * b_str.x; } else { ib = idx; } }\n");
                 } else {
                     code.push_str("        const uint ia = idx; const uint ib = idx;\n");
                 }

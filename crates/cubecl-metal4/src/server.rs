@@ -45,6 +45,12 @@ use cubecl_runtime::server::Handle;
 use cubecl_runtime::memory_management::{MemoryManagement, MemoryDeviceProperties as MMProps};
 use cubecl_ir::ElemType;
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct Msl4SpecKey {
+    entry: alloc::string::String,
+    line: u32,
+    types: alloc::vec::Vec<cubecl_ir::ElemType>,
+}
 /// Metal 4 compute server (scaffold).
 #[derive(Debug)]
 pub struct Metal4Server {
@@ -334,8 +340,21 @@ impl ComputeServer for Metal4Server {
 
         let mut kid = kernel.id();
         kid.mode(kind);
+        // Specialize kernel id by entrypoint, vectorization (line size), and element types
+        let spec = match compile.repr.as_ref() {
+            Some(m) => Msl4SpecKey {
+                entry: compile.entrypoint_name.clone(),
+                line: m.output_line_size,
+                types: m.buffers.iter().map(|p| p.elem).collect(),
+            },
+            None => Msl4SpecKey { entry: compile.entrypoint_name.clone(), line: 1, types: alloc::vec::Vec::new() },
+        };
+        let kid = kid.info(spec);
 
-        let pso = {
+        // Lookup PSO cache by specialized key
+        let pso = if let Some(p) = self.pipelines.get(&kid) {
+            p.clone()
+        } else {
             // Always compile fresh during development to avoid stale PSOs when source changes
             let opts = MTLCompileOptions::new();
             // Ensure MSL 4.0 language features are available
@@ -373,43 +392,28 @@ impl ComputeServer for Metal4Server {
                 .newLibraryWithSource_options_error(&src, Some(&opts))
                 .expect("Failed to compile MSL");
 
-            // Try Metal 4 compiler path first
-            let pso = (|| {
-                let comp_desc = MTL4CompilerDescriptor::new();
-                let compiler: Retained<ProtocolObject<dyn MTL4Compiler>> = self
-                    .device
-                    .newCompilerWithDescriptor_error(&comp_desc)
-                    .ok()?;
+            // Strict Metal 4 compiler path: require MTL4Compiler, no alternative compile paths
+            let comp_desc = MTL4CompilerDescriptor::new();
+            let compiler: Retained<ProtocolObject<dyn MTL4Compiler>> = self
+                .device
+                .newCompilerWithDescriptor_error(&comp_desc)
+                .expect("Metal 4 compiler unavailable. Require macOS with MTL4Compiler support.");
 
-                let lfd = MTL4LibraryFunctionDescriptor::new();
-                let entry = if use_mpp { "mpp_matmul_2d" } else { &compile.entrypoint_name };
-                let fname = NSString::from_str(entry);
-                lfd.setName(Some(&fname));
-                lfd.setLibrary(Some(&library));
+            let lfd = MTL4LibraryFunctionDescriptor::new();
+            let entry = if use_mpp { "mpp_matmul_2d" } else { &compile.entrypoint_name };
+            let fname = NSString::from_str(entry);
+            lfd.setName(Some(&fname));
+            lfd.setLibrary(Some(&library));
 
-                let cpdesc = MTL4ComputePipelineDescriptor::new();
-                // Upcast to base function descriptor
-                let base: &MTL4FunctionDescriptor = lfd.as_super();
-                cpdesc.setComputeFunctionDescriptor(Some(base));
+            let cpdesc = MTL4ComputePipelineDescriptor::new();
+            // Upcast to base function descriptor
+            let base: &MTL4FunctionDescriptor = lfd.as_super();
+            cpdesc.setComputeFunctionDescriptor(Some(base));
 
-                let pso = compiler
-                    .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&cpdesc, None)
-                    .ok()?;
-                Some(pso)
-            })()
-            .unwrap_or_else(|| {
-                // Fallback to older API if MTL4Compiler path is unavailable
-                let entry = if use_mpp { "mpp_matmul_2d" } else { &compile.entrypoint_name };
-                let fname = NSString::from_str(entry);
-                let function = library
-                    .newFunctionWithName(&fname)
-                    .expect("Missing entrypoint in library");
-                self
-                    .device
-                    .newComputePipelineStateWithFunction_error(&function)
-                    .expect("Failed to create compute pipeline state")
-            });
-            // Optionally cache latest
+            let pso = compiler
+                .newComputePipelineStateWithDescriptor_compilerTaskOptions_error(&cpdesc, None)
+                .expect("Failed to create compute pipeline state with MTL4Compiler");
+            // Cache
             self.pipelines.insert(kid.clone(), pso.clone());
             pso
         };
@@ -475,7 +479,18 @@ impl ComputeServer for Metal4Server {
             let data = &bindings.metadata.data;
             let module = compile.repr.as_ref();
             let buf_info = module.map(|m| m.buffers.as_slice());
-            let use_mpp = kernel.name().contains("mpp_matmul_2d") || compile.entrypoint_name.as_str() == "mpp_matmul_2d";
+            // Detect MPP by name or by type signature (half, half -> float with extended metadata)
+            let type_mpp = buf_info.and_then(|b| {
+                if b.len() >= 3 {
+                    let a = b[0].elem; let ha = b[0].has_extended_meta;
+                    let bb = b[1].elem; let hb = b[1].has_extended_meta;
+                    let c = b[2].elem; let hc = b[2].has_extended_meta;
+                    let is_half = matches!(a, cubecl_ir::ElemType::Float(cubecl_ir::FloatKind::F16)) && matches!(bb, cubecl_ir::ElemType::Float(cubecl_ir::FloatKind::F16));
+                    let is_f32 = matches!(c, cubecl_ir::ElemType::Float(cubecl_ir::FloatKind::F32));
+                    if is_half && is_f32 && ha && hb && hc { Some(true) } else { Some(false) }
+                } else { Some(false) }
+            }).unwrap_or(false);
+            let use_mpp = kernel.name().contains("mpp_matmul_2d") || compile.entrypoint_name.as_str() == "mpp_matmul_2d" || type_mpp;
             let num_ext = buf_info.map(|bi| bi.iter().filter(|p| p.has_extended_meta).count()).unwrap_or(0);
             let ranks_start = 2 * total_bufs;
             let shape_offs_start = ranks_start + num_ext;
@@ -493,18 +508,75 @@ impl ComputeServer for Metal4Server {
                 let elem_size = info.map(|p| elem_size_bytes(p.elem)).unwrap_or(1) as u64;
                 // For stability, bind as rank-1 tensor view using scalar length even when extended metadata exists.
                 // Extended metadata is still passed separately for broadcast/indexing in MSL.
-                let len: NSInteger = (res.size / elem_size as u64) as NSInteger;
-                let shape_vals = [len];
-                let stride_vals = [1 as NSInteger];
-                let dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
-                    .expect("extents");
-                let strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }
-                    .expect("strides");
+                // Build tensor extents: prefer 2D extents when extended metadata is available,
+                // falling back to rank-1 view otherwise.
+                let dims;
+                let strides;
+                if use_mpp {
+                    // Compute ext index for this buffer (count of previous extended metas)
+                    let mut ext_idx_i = 0usize;
+                    if let Some(modref) = module {
+                        for k in 0..i { if modref.buffers.get(k).map(|p| p.has_extended_meta).unwrap_or(false) { ext_idx_i += 1; } }
+                    }
+                    if ext_idx_i < num_ext {
+                        // Fetch shape and stride offsets
+                        if data.len() > shape_offs_start + ext_idx_i && data.len() > stride_offs_start + ext_idx_i {
+                            let shape_base = data[shape_offs_start + ext_idx_i] as usize;
+                            let stride_base = data[stride_offs_start + ext_idx_i] as usize;
+                            if shape_base < data.len() && stride_base < data.len() {
+                                // Derive 2D view even for rank-1: (dim0, 1) with strides (stride0, 1)
+                                let d0 = data[shape_base + 0] as NSInteger;
+                                let d1 = if shape_base + 1 < data.len() { data[shape_base + 1] as NSInteger } else { 1 as NSInteger };
+                                let s0 = data[stride_base + 0] as NSInteger;
+                                let s1 = if stride_base + 1 < data.len() { data[stride_base + 1] as NSInteger } else { 1 as NSInteger };
+                                // For MPP prefer (cols, rows)
+                                let shape_vals = [d1, d0];
+                                let stride_vals = [s1, s0];
+                                dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 2 as NSUInteger, shape_vals.as_ptr()) }
+                                    .expect("extents2");
+                                strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 2 as NSUInteger, stride_vals.as_ptr()) }
+                                    .expect("strides2");
+                            } else {
+                                let len: NSInteger = (res.size / elem_size as u64) as NSInteger;
+                                let shape_vals = [len];
+                                let stride_vals = [1 as NSInteger];
+                                dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
+                                    .expect("extents");
+                                strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }
+                                    .expect("strides");
+                            }
+                        } else {
+                            let len: NSInteger = (res.size / elem_size as u64) as NSInteger;
+                            let shape_vals = [len];
+                            let stride_vals = [1 as NSInteger];
+                            dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
+                                .expect("extents");
+                            strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }
+                                .expect("strides");
+                        }
+                    } else {
+                        let len: NSInteger = (res.size / elem_size as u64) as NSInteger;
+                        let shape_vals = [len];
+                        let stride_vals = [1 as NSInteger];
+                        dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
+                            .expect("extents");
+                        strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }
+                            .expect("strides");
+                    }
+                } else {
+                    let len: NSInteger = (res.size / elem_size as u64) as NSInteger;
+                    let shape_vals = [len];
+                    let stride_vals = [1 as NSInteger];
+                    dims = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, shape_vals.as_ptr()) }
+                        .expect("extents");
+                    strides = unsafe { MTLTensorExtents::initWithRank_values(MTLTensorExtents::alloc(), 1 as NSUInteger, stride_vals.as_ptr()) }
+                        .expect("strides");
+                }
                 if std::env::var("CUBECL_MTL4_DEBUG").ok().as_deref() == Some("1") {
                     let mut dbg_dims: Vec<isize> = Vec::new();
                     let mut dbg_strides: Vec<isize> = Vec::new();
                     // Read back dims/strides from our temporary extents to log (unsafe APIs don't expose readback; log computed arrays instead)
-                    // We already have 'shape_vals' and 'stride_vals' in scope above when extended meta is present. For fallback rank-1 we reconstructed arrays.
+                    // We already have 'shape_vals' and 'stride_vals' in scope above when extended meta is present. For rank-1 we reconstructed arrays.
                     // Here, rebuild basic debug from allocations we computed.
                     // Note: We cannot deref MTLTensorExtents here; just log our computed parameters below instead.
                     let _ = (dbg_dims, dbg_strides); // avoid unused warning
@@ -710,7 +782,21 @@ impl ComputeServer for Metal4Server {
         let mut groups = MTLSize { width: 1, height: 1, depth: 1 };
 
         // For MPP matmul kernels, infer grid from output tensor shape: grid.x = ceil(N/32), grid.y = ceil(M/64)
-        let mpp = kernel.name().contains("mpp_matmul_2d") || compile.entrypoint_name.as_str() == "mpp_matmul_2d";
+        let mpp = {
+            let module = compile.repr.as_ref();
+            let buf_info = module.map(|m| m.buffers.as_slice());
+            let type_mpp = buf_info.and_then(|b| {
+                if b.len() >= 3 {
+                    let a = b[0].elem; let ha = b[0].has_extended_meta;
+                    let bb = b[1].elem; let hb = b[1].has_extended_meta;
+                    let c = b[2].elem; let hc = b[2].has_extended_meta;
+                    let is_half = matches!(a, cubecl_ir::ElemType::Float(cubecl_ir::FloatKind::F16)) && matches!(bb, cubecl_ir::ElemType::Float(cubecl_ir::FloatKind::F16));
+                    let is_f32 = matches!(c, cubecl_ir::ElemType::Float(cubecl_ir::FloatKind::F32));
+                    if is_half && is_f32 && ha && hb && hc { Some(true) } else { Some(false) }
+                } else { Some(false) }
+            }).unwrap_or(false);
+            kernel.name().contains("mpp_matmul_2d") || compile.entrypoint_name.as_str() == "mpp_matmul_2d" || type_mpp
+        };
         if mpp {
             if let Some(module) = compile.repr.as_ref() {
                 if module.buffers.len() >= 3 {
@@ -726,13 +812,19 @@ impl ComputeServer for Metal4Server {
                     if ext_idx < num_ext && data.len() > shape_offs_start + ext_idx {
                         let shape_base = data[shape_offs_start + ext_idx] as usize;
                         if shape_base + 1 < data.len() {
-                            let n = data[shape_base + 0] as usize; // innermost
-                            let m = data[shape_base + 1] as usize; // outer
+                            // Shape order is (M, N)
+                            let m = data[shape_base + 0] as usize; // rows
+                            let n = data[shape_base + 1] as usize; // cols
                             let tile_m = 64usize; let tile_n = 32usize;
                             let gx = (n + tile_n - 1) / tile_n;
                             let gy = (m + tile_m - 1) / tile_m;
                             groups = MTLSize { width: gx.max(1), height: gy.max(1), depth: 1 };
-                            threads = MTLSize { width: 1, height: 1, depth: 1 };
+                            // Choose threadgroup size based on pipeline width; aim for 4 SIMD-groups per TG
+                            let tew = pso.threadExecutionWidth() as usize;
+                            let max_tg = pso.maxTotalThreadsPerThreadgroup() as usize;
+                            let want = (tew.max(1)) * 4;
+                            let tg_w = want.min(max_tg).max(tew);
+                            threads = MTLSize { width: tg_w, height: 1, depth: 1 };
                         }
                     }
                 }
@@ -867,7 +959,7 @@ fn map_elem_type_to_tensor_dtype(elem: cubecl_ir::ElemType) -> Option<MTLTensorD
         UInt(U8) | ElemType::Bool => Some(MTLTensorDataType::UInt8),
         UInt(U16) => Some(MTLTensorDataType::UInt16),
         UInt(U32) => Some(MTLTensorDataType::UInt32),
-        // Unsupported directly: fallback
+        // Unsupported directly: return None (not directly mappable)
         _ => None,
     }
 }
