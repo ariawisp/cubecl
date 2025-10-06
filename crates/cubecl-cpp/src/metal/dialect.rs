@@ -316,6 +316,22 @@ struct alignas({alignment}) {item} {{"
     fn compile_local_memory_qualifier(f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "thread")
     }
+
+    fn compile_shared_memory_declaration(
+        f: &mut std::fmt::Formatter<'_>,
+        shared: &shared::SharedMemory<Self>,
+    ) -> std::fmt::Result {
+        let item = shared.item;
+        let index = shared.index;
+        let offset = shared.offset;
+        let size = shared.length;
+        let size_bytes = size * shared.item.size() as u32;
+        writeln!(f, "// Shared memory size: {size}, {size_bytes} bytes")?;
+        writeln!(
+            f,
+            "threadgroup {item} *shared_memory_{index} = reinterpret_cast<threadgroup {item}*>(&dynamic_shared_mem[{offset}]);"
+        )
+    }
 }
 
 // Kernel argument bindings
@@ -419,9 +435,10 @@ void {kernel_name}("
                 .map(|smem| smem.align)
                 .max()
                 .unwrap();
+            // Place alignas on the variable, not the type
             writeln!(
                 f,
-                "threadgroup alignas({max_align}) uchar dynamic_shared_mem[{size}];",
+                "alignas({max_align}) threadgroup uchar dynamic_shared_mem[{size}];",
             )?;
         }
         Ok(())

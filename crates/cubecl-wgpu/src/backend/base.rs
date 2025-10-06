@@ -43,6 +43,18 @@ impl WgpuServer {
             #[cfg(all(feature = "msl", target_os = "macos"))]
             Some(AutoRepresentation::Msl(repr)) => {
                 let source = &kernel.source;
+                // Optional: dump generated MSL for debugging when CUBECL_DEBUG_MSL is set
+                if let Ok(dir) = std::env::var("CUBECL_DEBUG_MSL") {
+                    let _ = std::fs::create_dir_all(&dir);
+                    let mut path = std::path::PathBuf::from(dir);
+                    // Include entrypoint and workgroup dims for easier identification
+                    let fname = format!(
+                        "{}__wg_{}x{}x{}.metal",
+                        kernel.entrypoint_name, repr.cube_dim.x, repr.cube_dim.y, repr.cube_dim.z
+                    );
+                    path.push(fname);
+                    let _ = std::fs::write(&path, source);
+                }
                 unsafe {
                     self.device.create_shader_module_passthrough(
                         wgpu::ShaderModuleDescriptorPassthrough::Msl(
